@@ -1,0 +1,76 @@
+# Example: run gauntlet on every PR and comment the top findings.
+#
+# Copy this file into your repo as `.github/workflows/gauntlet.yml` and tune
+# the env vars + preview-URL resolution to match how your previews are
+# deployed (Vercel / Netlify / Fly / Render / Cloudflare Pages / custom).
+#
+# Prerequisites in your repo:
+#   - `.gauntlet/` already seeded (run `gauntlet init --url <prod-url>` once
+#     locally, commit the resulting `.gauntlet/surfaces/` + `.gauntlet/personas/`
+#     + `.gauntlet/flows/` directories). `.gauntlet/cache/`, `.gauntlet/auth/`,
+#     and `.gauntlet/runs/` should be gitignored.
+#   - Repo secret `ANTHROPIC_API_KEY` set in Settings → Secrets and variables.
+#   - For auth-walled surfaces: a separate workflow (or a manual run) that
+#     captures `.gauntlet/auth/<id>.json` and stores it as a secret, then
+#     materializes it back to disk in the workflow before `gauntlet run`.
+#
+# What this does on every PR:
+#   1. Resolves the PR's preview URL.
+#   2. Runs gauntlet against the marketing surface (adjust as needed).
+#   3. Builds the report (no vetting at PR speed; vet manually for releases).
+#   4. Posts top 5 findings as a PR comment via `gauntlet comment --pr`.
+
+name: gauntlet
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  gauntlet:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write   # required so `gh pr comment` can post.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Install gauntlet
+        run: |
+          # Adjust to your preferred install path. Pinning a tag is recommended
+          # for reproducible CI; main is shown here for simplicity.
+          git clone --depth=1 https://github.com/jesposito/gauntlet /opt/gauntlet
+          cd /opt/gauntlet && bun install && bunx playwright install --with-deps chromium
+
+      - name: Resolve PR preview URL
+        id: preview
+        run: |
+          # Replace this with whatever yields your PR preview URL. The
+          # built-in `gauntlet --pr <num>` resolver can also do this if you
+          # set `.gauntlet/config.json` `pr_url_template` or your preview
+          # platform (Vercel / Netlify / etc) posts the URL in a PR comment.
+          echo "url=https://example.com" >> "$GITHUB_OUTPUT"
+
+      - name: Run gauntlet
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          bun run /opt/gauntlet/src/cli.ts run \
+            --url "${{ steps.preview.outputs.url }}" \
+            --surface marketing \
+            --concurrency 2 \
+            --no-report
+
+      - name: Build unvetted report
+        run: |
+          bun run /opt/gauntlet/src/cli.ts report --no-vet
+
+      - name: Comment top findings on PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bun run /opt/gauntlet/src/cli.ts comment \
+            --pr ${{ github.event.pull_request.number }} \
+            --max 5 \
+            --repo ${{ github.repository }}

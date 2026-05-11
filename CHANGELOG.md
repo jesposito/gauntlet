@@ -6,6 +6,24 @@ The format roughly follows [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ## Unreleased
 
+### Added
+
+- **`gauntlet comment <run-dir> --pr <num>`**. Reads a built `report.json`
+  and posts a compact, prioritized PR comment via `gh pr comment`: top
+  findings ordered critical → minor, persona-abandon callouts, per-persona
+  flow outcome roll-up. Optional `--artifact-base <url>` makes screenshot
+  links resolve. `--dry-run` prints the body for inspection. Closes the
+  loop so engineering teams see gauntlet in the same thread they read
+  CI / lint / preview-deploy comments.
+- **`examples/gauntlet.yml`** GitHub Actions workflow template. Drop into
+  `.github/workflows/`, set `ANTHROPIC_API_KEY` repo secret, point preview-
+  URL step at your platform, and gauntlet runs on every PR + comments
+  top findings inline.
+- **"How is this different from X?" comparison table** in README. Lays
+  out the Gauntlet × {Synthetic Users, axe DevTools, browser-use,
+  Stagehand} matrix so the unique row (personas + real browser + a11y +
+  multi-surface + auth + PR integration) is visible at a glance.
+
 ### Fixed (codex review pass)
 
 - **`gauntlet init` actually generates surfaces now.** The interactive

@@ -211,6 +211,39 @@ gauntlet bench --sites ./my-sites.json
 
 Designed to be run weekly via GitHub Actions for a leaderboard / README badge ("Gauntlet found X bugs across N landing pages on YYYY-MM-DD"). Add new sites by PR to `bench/sites.json`.
 
+## Run on every PR (`gauntlet comment`)
+
+`gauntlet` is most useful when it shows up in the place engineers already work: the PR thread. The `comment` subcommand reads a built `report.json` and posts a compact summary to a GitHub PR via `gh pr comment`:
+
+```bash
+gauntlet comment .gauntlet/runs/2026-05-12T... --pr 123 --max 5 --repo owner/name
+```
+
+Comment shape (top findings, ordered critical → minor, with persona quotes for `abandoned_by_persona` events):
+
+```
+### 🎯 Gauntlet on marketing: 5 findings
+
+Personas run:
+- Mary (impatient creator) — signup=abandoned, pricing=patience_exceeded
+- Marcus (skeptical developer) — features=abandoned
+
+Top 5 findings:
+| Severity | What | Where | Who saw it |
+|---|---|---|---|
+| 🟥 CRITICAL | button-name: ... | /admin · [screenshot](...) | Marcus |
+| 🟧 SERIOUS | color-contrast: ... | /pricing · [screenshot](...) | Mary |
+| ...
+
+Persona quit at:
+- Mary: "couldn't find pricing in nav"
+- Marcus: "expected to see a 'self-host' link in features"
+
+driven by gauntlet
+```
+
+A full example workflow lives at [`examples/gauntlet.yml`](examples/gauntlet.yml). Drop it into your `.github/workflows/`, set the repo secret `ANTHROPIC_API_KEY`, point the preview-URL step at your platform, and gauntlet will comment on every PR.
+
 ## How accessibility findings are surfaced
 
 axe-core runs on every captured step (output: `steps/NNNN/axe.json`).
@@ -318,6 +351,24 @@ src/
         console.jsonl
         network.jsonl
 ```
+
+## How is this different from X?
+
+Short version: Gauntlet sits at the intersection of *AI personas*, *real browser drive*, and *a11y scanning*. No other tool we've found covers all three.
+
+|  | Gauntlet | [Synthetic Users](https://www.syntheticusers.com/) | [axe DevTools](https://www.deque.com/axe/devtools/) | [browser-use](https://github.com/browser-use/browser-use) | [Stagehand](https://github.com/browserbase/stagehand) |
+|---|:---:|:---:|:---:|:---:|:---:|
+| AI personas with character + behavior | ✅ | ✅ | ❌ | ❌ | ❌ |
+| Drives a real browser (Playwright) | ✅ | ❌ | ❌ | ✅ | ✅ |
+| axe-core scan at every step | ✅ | ❌ | ✅ | ❌ | ❌ |
+| Multi-surface (marketing / app / admin / ops) | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Auth-walled surfaces (`storageState` replay) | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Cross-surface rollup (find design-system bugs) | ✅ | ❌ | ❌ | ❌ | ❌ |
+| PR-preview integration (`--pr <num>` + GH Action) | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Self-hosted / MIT | ✅ | ❌ | partial | ✅ | ✅ |
+| BYO AI key | ✅ | ❌ | n/a | ✅ | ✅ |
+
+Other tools that come up in the same conversation: [Playwright](https://playwright.dev) (the browser driver Gauntlet sits on top of), [Pa11y](https://pa11y.org) (axe-style scanner without personas or a browser-driving agent), [Maze](https://maze.co) (human user-testing platform, not AI).
 
 ## Related tools
 

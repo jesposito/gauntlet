@@ -16,6 +16,9 @@ import { buildReport, findLatestRunDir } from "./report/build.ts";
 import { buildCrossSurfaceReport } from "./report/cross-surface.ts";
 import { seedProject } from "./init/seed.ts";
 import { loadSitesFile, runBench, saveBenchReport } from "./bench/runner.ts";
+import { renderPrComment } from "./comment/render.ts";
+import { readFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
 import { DEFAULT_MODEL, pickProvider } from "./ai/index.ts";
 import { configureAiCache, getAiCache } from "./ai/cache.ts";
 import { readProject } from "./init/project-reader.ts";
@@ -468,6 +471,68 @@ async function cmdReport(args: ParsedArgs): Promise<void> {
   }
 }
 
+async function cmdComment(args: ParsedArgs): Promise<void> {
+  const cwd = process.cwd();
+  const runDir =
+    typeof args.positional[0] === "string"
+      ? args.positional[0]
+      : typeof args.flags.run === "string"
+        ? args.flags.run
+        : await findLatestRunDir(cwd);
+  if (!runDir) {
+    console.error("error: no run directory found. pass `gauntlet comment <run-dir>` or run gauntlet first.");
+    process.exit(2);
+  }
+
+  const prArg = args.flags.pr;
+  const prNumber = typeof prArg === "string" ? Number(prArg) : undefined;
+  const maxFindings = args.flags.max ? Number(args.flags.max) : 5;
+  const artifactBase = typeof args.flags["artifact-base"] === "string" ? args.flags["artifact-base"] : undefined;
+  const runUrl = typeof args.flags["run-url"] === "string" ? args.flags["run-url"] : undefined;
+  const dryRun = args.flags["dry-run"] === true;
+  const repo = typeof args.flags.repo === "string" ? args.flags.repo : undefined;
+
+  let report;
+  try {
+    const raw = await readFile(join(runDir, "report.json"), "utf8");
+    report = JSON.parse(raw);
+  } catch {
+    console.error(`error: ${runDir}/report.json not found. Run \`gauntlet report\` first.`);
+    process.exit(2);
+  }
+
+  const body = renderPrComment({
+    report,
+    maxFindings,
+    ...(artifactBase ? { artifactBase } : {}),
+    ...(runUrl ? { runUrl } : {}),
+    ...(prNumber !== undefined ? { prNumber } : {}),
+  });
+
+  if (dryRun || prNumber === undefined) {
+    // No PR target — print the body for piping/inspection.
+    if (prNumber === undefined && !dryRun) {
+      console.error("note: no --pr given; printing comment body. Pass --pr <num> to actually post.");
+    }
+    console.log(body);
+    return;
+  }
+
+  // Post via gh CLI. Requires gh authenticated in the workflow / shell.
+  const ghArgs = ["pr", "comment", String(prNumber), "--body", body];
+  if (repo) {
+    ghArgs.push("--repo", repo);
+  }
+  const proc = spawnSync("gh", ghArgs, { stdio: ["ignore", "inherit", "inherit"] });
+  if (proc.status !== 0) {
+    console.error(
+      `error: gh pr comment failed (exit ${proc.status}). Is gh installed and authenticated?`,
+    );
+    process.exit(proc.status ?? 1);
+  }
+  console.log(`posted gauntlet comment to PR #${prNumber}${repo ? ` on ${repo}` : ""}.`);
+}
+
 async function cmdBench(args: ParsedArgs): Promise<void> {
   const cwd = process.cwd();
   const sitesPath =
@@ -902,6 +967,8 @@ usage:
   gauntlet seed [<cwd>] --url <urls> [--personas N] [--flows N]
   gauntlet bench [--sites <path>] [--limit N] [--only <names>] [--personas N]
   gauntlet cross-report [--surfaces <ids>] [--runs <dirs>] [--vet] [--vet-top N]
+  gauntlet comment [<run-dir>] --pr <num> [--max N] [--artifact-base <url>]
+                   [--run-url <url>] [--repo owner/name] [--dry-run]
   gauntlet list
   gauntlet help
 
@@ -1001,6 +1068,9 @@ async function main(): Promise<void> {
       break;
     case "bench":
       await cmdBench(args);
+      break;
+    case "comment":
+      await cmdComment(args);
       break;
     case "list":
       await cmdList();
