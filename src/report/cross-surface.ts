@@ -36,9 +36,53 @@ export interface CrossSurfaceReport {
   totalUniqueSignatures: number;
 }
 
-function signatureOf(reason: string, axeRuleId?: string): string {
+/**
+ * Path family: first 2 path segments. Two URLs are in the same family iff
+ * their first two segments match. e.g.
+ *   /admin/blog/posts/123  ->  /admin/blog/*
+ *   /admin/blog/edit       ->  /admin/blog/*
+ *   /admin/settings        ->  /admin/settings/*
+ * Used for cross-surface signature so console errors on /admin/blog and
+ * console errors on /admin/settings don't collapse into one "systemic" pattern.
+ */
+function pathFamily(url: string): string {
+  try {
+    const u = new URL(url);
+    const segs = u.pathname.split("/").filter(Boolean).slice(0, 2);
+    if (segs.length === 0) return "/";
+    return "/" + segs.join("/") + (segs.length > 0 ? "/*" : "");
+  } catch {
+    return "/";
+  }
+}
+
+/**
+ * Normalize a console-error / abandon message into a stable key. Strips
+ * absolute URLs, dynamic IDs, and trailing punctuation so two messages
+ * about the same underlying problem collapse but two genuinely-different
+ * messages don't.
+ */
+function normalizeMessage(message: string): string {
+  return message
+    .replace(/https?:\/\/[^\s'"`)]+/gi, "<url>")
+    .replace(/\b[0-9a-f]{8,}\b/gi, "<hash>")
+    .replace(/\b\d{3,}\b/g, "<n>")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80);
+}
+
+function signatureOf(
+  reason: string,
+  axeRuleId: string | undefined,
+  url: string,
+  message: string,
+): string {
   if (axeRuleId) return `axe:${axeRuleId}`;
-  return reason;
+  // Non-axe: include normalized message + url path family so unrelated
+  // console errors on different surface routes don't get treated as one
+  // systemic pattern.
+  return `${reason} @ ${pathFamily(url)} :: ${normalizeMessage(message)}`;
 }
 
 export function buildCrossSurface(runs: SurfaceRun[]): CrossSurfaceReport {
@@ -50,7 +94,7 @@ export function buildCrossSurface(runs: SurfaceRun[]): CrossSurfaceReport {
   for (const r of runs) {
     for (const persona of r.report.personas) {
       for (const f of persona.findings) {
-        const key = signatureOf(f.reason, f.axeRuleId);
+        const key = signatureOf(f.reason, f.axeRuleId, f.url, f.title);
         let entry = byKey.get(key);
         if (!entry) {
           entry = { title: f.title, surfaces: new Set(), personas: new Set(), total: 0 };

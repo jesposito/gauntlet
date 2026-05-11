@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { writeFile } from "node:fs/promises";
-import type { Browser } from "playwright";
+import type { Browser, BrowserContext } from "playwright";
 import { chromium } from "playwright";
 import type { Persona } from "../persona/schema.ts";
 import type { Flow } from "../flow/schema.ts";
@@ -34,6 +34,30 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
     timer = setTimeout(() => rej(new StepTimeoutError(label, ms)), ms);
   });
   return Promise.race([p, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  }) as Promise<T>;
+}
+
+/**
+ * Like withTimeout, but feeds an AbortSignal into the builder. On timeout the
+ * signal is aborted so the underlying op (AI fetch, etc) actually stops
+ * mutating state instead of running to completion in the background. Used
+ * for observe/act/judgeStep where the work is an HTTP call to an AI provider.
+ */
+function withCancellableTimeout<T>(
+  build: (signal: AbortSignal) => Promise<T>,
+  ms: number,
+  label: string,
+): Promise<T> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, rej) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      rej(new StepTimeoutError(label, ms));
+    }, ms);
+  });
+  return Promise.race([build(controller.signal), timeout]).finally(() => {
     if (timer) clearTimeout(timer);
   }) as Promise<T>;
 }
@@ -116,9 +140,20 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
   const stepResults: StepResult[] = [];
   emit({ type: "flow_start", personaId: persona.id, flowId: flow.id, totalSteps: flow.steps.length });
 
-  const browser: Browser = await chromium.launch({ headless });
+  // Resources held by this flow. Declared up-front so the outer try/finally
+  // can close them even if mid-flow code throws an unexpected error (schema
+  // parse failure, provider crash, disk full on captureStep, etc).
+  let browser: Browser | undefined;
+  let context: BrowserContext | undefined;
+  let outcome: FlowRunResult["outcome"] = "completed";
+  let outcomeReason: string | undefined;
+  let startUrl: string = url;
+
+  try {
+
+  browser = await chromium.launch({ headless });
   const ua = DEVICE_USER_AGENTS[persona.behavior.device] ?? DEVICE_USER_AGENTS.desktop!;
-  const context = await browser.newContext({
+  context = await browser.newContext({
     viewport: persona.behavior.viewport,
     userAgent: ua,
     hasTouch:
@@ -217,14 +252,11 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
   });
 
   const captureCtx: CaptureContext = { runDir, consoleLog, networkLog };
-  const startUrl = resolveStartUrl(url, flow.starting_url_hint);
+  startUrl = resolveStartUrl(url, flow.starting_url_hint);
   const personaRules = [
     ...persona.behavior.abandons_on,
     ...persona.behavior.avoids,
   ];
-
-  let outcome: FlowRunResult["outcome"] = "completed";
-  let outcomeReason: string | undefined;
 
   try {
     await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
@@ -272,8 +304,8 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
 
       try {
       if (step.observation_target) {
-        const obs = await withTimeout(
-          observe(actionCtx, step.observation_target),
+        const obs = await withCancellableTimeout(
+          (signal) => observe({ ...actionCtx, signal }, step.observation_target!),
           STEP_OP_TIMEOUT_MS,
           "observe",
         );
@@ -312,8 +344,8 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
         }
       }
 
-      const actionResult = await withTimeout(
-        act(actionCtx, step.intent),
+      const actionResult = await withCancellableTimeout(
+        (signal) => act({ ...actionCtx, signal }, step.intent),
         STEP_OP_TIMEOUT_MS,
         "act",
       );
@@ -375,20 +407,22 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
         });
       }
 
-      const verdict = await withTimeout(
-        judgeStep({
-          provider,
-          page,
-          step,
-          stepIndex: i,
-          totalSteps: flow.steps.length,
-          ...(persona.character.voice ? { personaVoice: persona.character.voice } : {}),
-          actionResult: {
-            performed: actionResult.performed,
-            ...(actionResult.action !== undefined ? { action: actionResult.action } : {}),
-            ...(actionResult.error !== undefined ? { error: actionResult.error } : {}),
-          },
-        }),
+      const verdict = await withCancellableTimeout(
+        (signal) =>
+          judgeStep({
+            provider,
+            page,
+            step,
+            stepIndex: i,
+            totalSteps: flow.steps.length,
+            ...(persona.character.voice ? { personaVoice: persona.character.voice } : {}),
+            actionResult: {
+              performed: actionResult.performed,
+              ...(actionResult.action !== undefined ? { action: actionResult.action } : {}),
+              ...(actionResult.error !== undefined ? { error: actionResult.error } : {}),
+            },
+            signal,
+          }),
         STEP_OP_TIMEOUT_MS,
         "judgeStep",
       );
@@ -470,18 +504,26 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
     "utf8",
   );
 
-  // Close with hard timeouts; if Playwright hangs, force-kill the browser
-  // process rather than blocking the entire run forever.
-  const CLOSE_TIMEOUT_MS = 8_000;
-  try {
-    await withTimeout(context.close(), CLOSE_TIMEOUT_MS, "context.close");
-  } catch {
-    /* ignore — proceed to browser.close which kills the process */
-  }
-  try {
-    await withTimeout(browser.close(), CLOSE_TIMEOUT_MS, "browser.close");
-  } catch {
-    /* ignore — process leak is preferable to hung run */
+  } finally {
+    // Close with hard timeouts; if Playwright hangs, force-kill the browser
+    // process rather than blocking the entire run forever. Wrapped in
+    // finally so non-timeout exceptions (provider crash, disk full, etc)
+    // also release Playwright handles.
+    const CLOSE_TIMEOUT_MS = 8_000;
+    if (context) {
+      try {
+        await withTimeout(context.close(), CLOSE_TIMEOUT_MS, "context.close");
+      } catch {
+        /* ignore — proceed to browser.close which kills the process */
+      }
+    }
+    if (browser) {
+      try {
+        await withTimeout(browser.close(), CLOSE_TIMEOUT_MS, "browser.close");
+      } catch {
+        /* ignore — process leak is preferable to hung run */
+      }
+    }
   }
 
   const durationMs = Date.now() - startedAt;

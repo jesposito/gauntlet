@@ -21,6 +21,37 @@ describe("applyTemplate", () => {
       }),
     ).toBe("https://main--pr-7.example.com");
   });
+
+  test("slugs branch names with slashes and spaces", () => {
+    expect(
+      applyTemplate("https://pr-{branch}.preview.example.com", {
+        number: 1,
+        branch: "feature/foo bar",
+      }),
+    ).toBe("https://pr-feature-foo-bar.preview.example.com");
+  });
+
+  test("strips characters that would corrupt the host", () => {
+    // Adversarial branch trying to inject a different host. After slug,
+    // the result is a long flat label - no '@' or '.' that could redirect.
+    const url = applyTemplate("https://pr-{branch}.example.com", {
+      number: 99,
+      branch: "x@evil.com/y",
+    });
+    expect(url).toBe("https://pr-x-evil-com-y.example.com");
+    expect(url.startsWith("https://pr-")).toBe(true);
+    expect(url.endsWith(".example.com")).toBe(true);
+  });
+
+  test("caps branch slug at 63 chars (DNS label limit)", () => {
+    const longBranch = "a".repeat(200);
+    const url = applyTemplate("https://{branch}.preview.example.com", {
+      number: 1,
+      branch: longBranch,
+    });
+    const m = url.match(/^https:\/\/([^.]+)\.preview\.example\.com$/);
+    expect(m?.[1]?.length).toBeLessThanOrEqual(63);
+  });
 });
 
 describe("scanCommentsForPreviewUrl", () => {

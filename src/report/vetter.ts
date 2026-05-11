@@ -2,6 +2,8 @@ import { chromium, type Browser, type BrowserContext, type Page } from "playwrig
 import { runAxe } from "../runner/axe-scan.ts";
 import type { Finding } from "./schema.ts";
 import { FailureReason } from "../runner/failure-reasons.ts";
+import { loadSurface } from "../surface/loader.ts";
+import { resolveAuthStatePath } from "../auth/capture.ts";
 
 export interface VetResult {
   status: Finding["vetting"]["status"];
@@ -20,8 +22,15 @@ interface UrlSession {
   navError: string | undefined;
 }
 
-async function openSession(browser: Browser, url: string, timeoutMs: number): Promise<UrlSession> {
-  const context = await browser.newContext();
+async function openSession(
+  browser: Browser,
+  url: string,
+  timeoutMs: number,
+  storageStatePath?: string,
+): Promise<UrlSession> {
+  const context = await browser.newContext(
+    storageStatePath ? { storageState: storageStatePath } : {},
+  );
   const page = await context.newPage();
   const consoleErrors: string[] = [];
   let saw5xx = false;
@@ -118,6 +127,11 @@ function vetFromSession(finding: Finding, s: UrlSession): VetResult {
 export interface VetOptions {
   headless?: boolean;
   timeoutMs?: number;
+  /**
+   * cwd used to resolve relative surface auth_state paths. Default = process.cwd().
+   * Pass the run's project root when vetting reports built outside the user's cwd.
+   */
+  cwd?: string;
 }
 
 /**
@@ -129,8 +143,29 @@ export async function vetAll(findings: Finding[], opts: VetOptions = {}): Promis
   if (findings.length === 0) return findings;
   const headless = opts.headless ?? true;
   const timeoutMs = opts.timeoutMs ?? 30_000;
+  const cwd = opts.cwd ?? process.cwd();
+
+  // Resolve each finding's surface.auth_state once. Surfaces without
+  // auth_state (or findings without surfaceId) get undefined and reuse
+  // the unauthed session pool.
+  const surfaceAuthByid = new Map<string, string | undefined>();
+  async function authStateFor(surfaceId: string | undefined): Promise<string | undefined> {
+    if (!surfaceId) return undefined;
+    if (surfaceAuthByid.has(surfaceId)) return surfaceAuthByid.get(surfaceId);
+    try {
+      const s = await loadSurface(surfaceId, cwd);
+      const abs = resolveAuthStatePath(cwd, s.auth_state);
+      surfaceAuthByid.set(surfaceId, abs);
+      return abs;
+    } catch {
+      surfaceAuthByid.set(surfaceId, undefined);
+      return undefined;
+    }
+  }
 
   const browser: Browser = await chromium.launch({ headless });
+  // Key sessions by (url, auth-state-path) so two findings from different
+  // surfaces at the same URL don't get cross-contaminated cookies.
   const sessions = new Map<string, UrlSession>();
   const out: Finding[] = [];
 
@@ -157,10 +192,12 @@ export async function vetAll(findings: Finding[], opts: VetOptions = {}): Promis
         });
         continue;
       }
-      let session = sessions.get(f.url);
+      const authState = await authStateFor(f.surfaceId);
+      const sessionKey = `${f.url}|${authState ?? ""}`;
+      let session = sessions.get(sessionKey);
       if (!session) {
-        session = await openSession(browser, f.url, timeoutMs);
-        sessions.set(f.url, session);
+        session = await openSession(browser, f.url, timeoutMs, authState);
+        sessions.set(sessionKey, session);
       }
       const v = vetFromSession(f, session);
       out.push({

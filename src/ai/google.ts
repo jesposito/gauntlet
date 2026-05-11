@@ -53,6 +53,7 @@ class GoogleProvider implements AiProvider {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
+      ...(opts.signal ? { signal: opts.signal } : {}),
     });
     if (!res.ok) throw new Error(`google ${res.status}: ${await res.text()}`);
     const json = (await res.json()) as GeminiResponse;

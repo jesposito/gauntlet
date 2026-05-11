@@ -6,6 +6,61 @@ The format roughly follows [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ## Unreleased
 
+### Fixed (codex review pass)
+
+- **`gauntlet init` actually generates surfaces now.** The interactive
+  init pipeline silently skipped surface discovery, so the documented
+  workflow `init → flows → run --surface` went through curate, no
+  surfaces landed on disk, then `--surface foo` found nothing. Now
+  init runs Phase A2 (surface generation + write) between project read
+  and persona generation. Reuses existing yamls; pass
+  `--refresh-surfaces` to regenerate. Closes `gauntlet-3w2`.
+- **Personas keep their surface tag.** `candidateToPersona` was dropping
+  `surface` when converting from candidate to persona, so even when
+  the AI assigned a surface during generation the written yaml had no
+  surface field. Preserved now.
+- **`gauntlet flows` is surface-aware.** Loads each persona's
+  `surface` field and passes the matching `Surface` to `generateFlows`
+  so flows respect the surface's `features` / `excluded_features`.
+- **`withTimeout` actually cancels.** Per-step timeout was using
+  `Promise.race` against a `setTimeout` — that only stopped *awaiting*,
+  the in-flight AI fetch kept running and could mutate state after the
+  flow had bailed. New `withCancellableTimeout` creates an
+  `AbortController`, threads `signal` into all four providers
+  (anthropic/openai/google/ollama) via `ProposeOptions.signal`,
+  `ActionContext.signal`, `JudgeContext.signal`. observe/act/judgeStep
+  call sites use it. Closes `gauntlet-yi0`.
+- **`runFlow` no longer leaks browser handles on non-timeout errors.**
+  Wrapped the entire post-launch body in `try { } finally {
+  closeWithTimeout(context); closeWithTimeout(browser); }`. A schema
+  parse error, provider crash, or disk-full writeFile now releases
+  Playwright handles instead of leaving zombie Chromium processes.
+  Closes `gauntlet-t2g`.
+- **Vetter replays authenticated findings with `storageState`.** Findings
+  carry an optional `surfaceId`; vetter resolves the surface's
+  `auth_state` (cached), keys sessions by `(url, auth-state)` so two
+  findings from different surfaces at the same URL don't share cookies,
+  and creates contexts with `storageState`. Auth-walled findings are no
+  longer downgraded to `could_not_replay`. Closes `gauntlet-7l0`.
+- **Auth state + AI cache file permissions.** `.gauntlet/auth/` and
+  `.gauntlet/cache/ai/` are now `mode 0o700` dirs with `mode 0o600`
+  files. Cookies + cached prompts (which can contain authed page text)
+  are no longer world-readable on shared boxes. Closes `gauntlet-bxx`.
+- **PR URL template slugs branch names.** Raw branch interpolation
+  let a hostile or malformed branch produce host-confusable URLs.
+  `applyTemplate` now slugs branches (lowercase, non-alnum→`-`, trim,
+  63-char cap). Final URL gated through `validatePreviewUrl` which
+  rejects non-http(s) protocols and malformed hosts. Closes
+  `gauntlet-a8f`.
+- **Cross-surface signature uses path family + normalized message for
+  non-axe findings.** Previously `console_error@https://m.com/` and
+  `console_error@https://m.com/admin` collapsed to one "systemic"
+  pattern even when the underlying messages were unrelated. Now the
+  signature includes a 2-segment path family + a URL/hash/number-
+  normalized message excerpt, so unrelated console errors stay
+  distinct but the same browser-shimmed runtime error across surfaces
+  still aggregates. Closes `gauntlet-1dc`.
+
 ### Added
 
 - **`gauntlet bench`: WebVoyager-style benchmark harness.** Loops over a

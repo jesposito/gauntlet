@@ -46,6 +46,7 @@ class OpenAiProvider implements AiProvider {
         temperature: opts.temperature ?? 0.7,
         response_format: { type: "json_object" },
       }),
+      ...(opts.signal ? { signal: opts.signal } : {}),
     });
     if (!res.ok) throw new Error(`openai ${res.status}: ${await res.text()}`);
     const json = (await res.json()) as OpenAiResponse;

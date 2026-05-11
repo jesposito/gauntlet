@@ -10,6 +10,7 @@ import { runPersona } from "./runner/browser.ts";
 import { runFlow, type FlowEvent } from "./runner/flow-runner.ts";
 import { runWithConcurrency } from "./util/pool.ts";
 import { loadAllSurfaces, loadSurface, writeSurface } from "./surface/loader.ts";
+import { generateSurfaces } from "./init/surface-generator.ts";
 import { captureAuth, resolveAuthStatePath } from "./auth/capture.ts";
 import { buildReport, findLatestRunDir } from "./report/build.ts";
 import { buildCrossSurfaceReport } from "./report/cross-surface.ts";
@@ -728,6 +729,27 @@ async function cmdInit(args: ParsedArgs): Promise<void> {
   const templates = await loadTemplates();
   console.log(`  templates loaded: ${templates.length}`);
 
+  // [Phase A2] Generate surfaces from the landings before personas — personas
+  // need a surface to live on. Skip if the user has already curated surfaces
+  // and didn't pass --refresh-surfaces.
+  const refreshSurfaces = args.flags["refresh-surfaces"] === true;
+  let surfaces = await loadAllSurfaces(cwd);
+  if (surfaces.length === 0 || refreshSurfaces) {
+    console.log("\n[Phase A2] AI proposing surfaces from landings + README...");
+    const proposed = await generateSurfaces({ provider, project });
+    console.log(`  ${proposed.length} surface${proposed.length === 1 ? "" : "s"} proposed`);
+    for (const s of proposed) {
+      const auth = s.requires_auth ? " (requires_auth)" : "";
+      console.log(`    - ${s.id} (${s.name})${auth} base=${s.base_url ?? "(unset)"}`);
+      await writeSurface(s, cwd);
+    }
+    surfaces = proposed;
+  } else {
+    console.log(
+      `\n[Phase A2] reusing ${surfaces.length} existing surface yaml${surfaces.length === 1 ? "" : "s"} (pass --refresh-surfaces to regenerate)`,
+    );
+  }
+
   const existingIds = await listCuratedIds(cwd);
   if (existingIds.length > 0) {
     console.log(
@@ -742,6 +764,7 @@ async function cmdInit(args: ParsedArgs): Promise<void> {
     templates,
     count: requested,
     existing: existingIds,
+    ...(surfaces.length > 0 ? { surfaces } : {}),
   });
   console.log(`  got ${candidates.length} unique candidates.`);
 
@@ -755,6 +778,7 @@ async function cmdInit(args: ParsedArgs): Promise<void> {
         templates,
         count: 1,
         existing: [...existingIds, ...result.accepted.map((p) => p.id)],
+        ...(surfaces.length > 0 ? { surfaces } : {}),
       });
       return fresh[0];
     },
@@ -810,17 +834,40 @@ async function cmdFlows(args: ParsedArgs): Promise<void> {
 
   const summary: { persona: string; accepted: number; rejected: number }[] = [];
 
+  // Surface lookup cache. Surface-aware flow generation respects each
+  // surface's features / excluded_features so the AI doesn't propose flows
+  // targeting capabilities the persona's surface doesn't expose.
+  const surfaceCache = new Map<string, Awaited<ReturnType<typeof loadSurface>> | undefined>();
+  async function surfaceFor(id: string | undefined): Promise<
+    Awaited<ReturnType<typeof loadSurface>> | undefined
+  > {
+    if (!id) return undefined;
+    if (surfaceCache.has(id)) return surfaceCache.get(id);
+    try {
+      const s = await loadSurface(id, cwd);
+      surfaceCache.set(id, s);
+      return s;
+    } catch {
+      surfaceCache.set(id, undefined);
+      return undefined;
+    }
+  }
+
   for (const id of personaIds) {
     const persona = await loadPersona(id, cwd);
-    console.log(`\n[Phase C] ${persona.id} (${persona.character.name})`);
-    const flows = await generateFlows({ provider, project, persona, count });
+    const surface = await surfaceFor(persona.surface);
+    const surfaceTag = surface ? ` [surface=${surface.id}]` : persona.surface ? ` [surface=${persona.surface} (yaml missing)]` : "";
+    console.log(`\n[Phase C] ${persona.id} (${persona.character.name})${surfaceTag}`);
+    const flowOpts: Parameters<typeof generateFlows>[0] = { provider, project, persona, count };
+    if (surface) flowOpts.surface = surface;
+    const flows = await generateFlows(flowOpts);
     console.log(`  AI proposed ${flows.length} flow${flows.length === 1 ? "" : "s"}`);
 
     const result = await curateFlows(flows, {
       cwd,
       regenerate: async () => {
         console.log("regenerating flows for this persona...");
-        return generateFlows({ provider, project, persona, count });
+        return generateFlows(flowOpts);
       },
     });
 

@@ -70,6 +70,7 @@ class AnthropicProvider implements AiProvider {
         "anthropic-version": API_VERSION,
       },
       body: JSON.stringify(body),
+      ...(opts.signal ? { signal: opts.signal } : {}),
     });
 
     if (!res.ok) {

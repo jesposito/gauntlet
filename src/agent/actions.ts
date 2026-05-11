@@ -35,6 +35,12 @@ export interface ActionContext {
   provider: AiProvider;
   page: Page;
   personaVoice?: string;
+  /**
+   * Optional AbortSignal threaded into AI provider calls. When the flow-runner
+   * step times out, this signal fires and the in-flight fetch is cancelled
+   * rather than continuing to mutate the page in the background.
+   */
+  signal?: AbortSignal;
 }
 
 export interface ObserveResult {
@@ -73,6 +79,7 @@ export async function observe(
     schemaName: "LocatorPick",
     maxTokens: 400,
     temperature: 0,
+    ...(ctx.signal ? { signal: ctx.signal } : {}),
   });
   const match = result.idx >= 0 ? outline[result.idx] : undefined;
   return { match, reasoning: result.reasoning, outline };
@@ -123,6 +130,7 @@ export async function act(ctx: ActionContext, instruction: string): Promise<ActR
     schemaName: "ActionPick",
     maxTokens: 500,
     temperature: 0,
+    ...(ctx.signal ? { signal: ctx.signal } : {}),
   });
 
   if (pick.idx < 0 || pick.idx >= outline.length) {
@@ -247,5 +255,6 @@ export async function extract<T>(
     schemaName,
     maxTokens: 1500,
     temperature: 0,
+    ...(ctx.signal ? { signal: ctx.signal } : {}),
   });
 }

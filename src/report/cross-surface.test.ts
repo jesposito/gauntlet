@@ -110,7 +110,9 @@ describe("buildCrossSurface", () => {
     ];
     const r = buildCrossSurface(runs);
     expect(r.patterns[0]!.signature).toBe("axe:color-contrast"); // 3 surfaces beats 4-count narrow
-    expect(r.patterns[1]!.signature).toBe("console_error");
+    // Non-axe signatures now include path family + normalized message, so
+    // the rolled-up console_error signature starts with the reason name.
+    expect(r.patterns[1]!.signature.startsWith("console_error")).toBe(true);
   });
 
   test("empty runs returns empty report", () => {

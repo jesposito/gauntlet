@@ -56,7 +56,9 @@ export async function captureAuth(opts: CaptureAuthOptions): Promise<CaptureAuth
     : resolve(opts.cwd, opts.outputPath ?? defaultOut);
   const outRel = relative(opts.cwd, outAbs);
 
-  await mkdir(dirname(outAbs), { recursive: true });
+  // Auth state contains cookies + localStorage tokens — protect from
+  // group/world readers on shared boxes.
+  await mkdir(dirname(outAbs), { recursive: true, mode: 0o700 });
 
   const browser = await chromium.launch({ headless: false });
   const context = await browser.newContext();
@@ -73,7 +75,10 @@ export async function captureAuth(opts: CaptureAuthOptions): Promise<CaptureAuth
   await waitForEnter();
 
   const state = await context.storageState();
-  await writeFile(outAbs, JSON.stringify(state, null, 2), "utf8");
+  await writeFile(outAbs, JSON.stringify(state, null, 2), {
+    encoding: "utf8",
+    mode: 0o600,
+  });
 
   await context.close();
   await browser.close();

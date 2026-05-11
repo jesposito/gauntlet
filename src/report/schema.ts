@@ -27,6 +27,12 @@ export const FindingSchema = z.object({
   flowId: z.string().optional(),
   stepIndex: z.number().int().optional(),
   url: z.string(),
+  /**
+   * Surface this finding originated from, when the flow was scoped to one.
+   * Used by the vetter to load the surface's auth_state so replays of
+   * behind-login findings actually hit the authed view, not the login wall.
+   */
+  surfaceId: z.string().optional(),
   reason: z.nativeEnum(FailureReason),
   severity: SeveritySchema,
   title: z.string(),

@@ -13,6 +13,12 @@ export interface ProposeOptions<T> {
   schemaDescription?: string;
   maxTokens?: number;
   temperature?: number;
+  /**
+   * Optional AbortSignal — when aborted, the underlying fetch is cancelled.
+   * Used by flow-runner's per-step timeout so a hung AI call actually
+   * stops mutating state instead of running to completion in the background.
+   */
+  signal?: AbortSignal;
 }
 
 export interface AiProvider {

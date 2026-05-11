@@ -82,7 +82,10 @@ export class AiCache {
 
   async set<T>(inputs: CacheKeyInputs, output: T): Promise<void> {
     if (!this.enabled) return;
-    await mkdir(this.dir, { recursive: true });
+    // Cache entries persist full prompts (README, DOM outlines, URLs, possibly
+    // page text from authed surfaces). Treat as semi-sensitive: 0700 dir, 0600
+    // files, so a shared-box neighbor can't read another user's prompts.
+    await mkdir(this.dir, { recursive: true, mode: 0o700 });
     const hash = hashKey(inputs);
     const entry: CacheEntry<T> = {
       hash,
@@ -90,7 +93,10 @@ export class AiCache {
       inputs,
       output,
     };
-    await writeFile(this.pathFor(hash), JSON.stringify(entry, null, 2), "utf8");
+    await writeFile(this.pathFor(hash), JSON.stringify(entry, null, 2), {
+      encoding: "utf8",
+      mode: 0o600,
+    });
     this.writes += 1;
   }
 

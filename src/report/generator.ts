@@ -15,6 +15,7 @@ interface FlowResultFile {
   flow: string;
   url: string;
   startUrl?: string;
+  surface?: string;
   startedAt: number;
   finishedAt: number;
   outcome: "completed" | "abandoned" | "patience_exceeded" | "timeout" | "error";
@@ -204,6 +205,7 @@ export async function buildPersonaReport(
         flowId,
         ...(failure.stepIndex >= 0 ? { stepIndex: failure.stepIndex } : {}),
         url: failure.url,
+        ...(result.surface ? { surfaceId: result.surface } : {}),
         reason: failure.reason,
         severity,
         title,

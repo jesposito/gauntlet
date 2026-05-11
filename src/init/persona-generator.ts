@@ -157,6 +157,7 @@ export function candidateToPersona(c: PersonaCandidate): Persona {
     id: c.id,
     character: c.character,
     behavior: c.behavior,
+    ...(c.surface !== undefined ? { surface: c.surface } : {}),
     ...(c.analytics_grounding !== undefined
       ? { analytics_grounding: c.analytics_grounding }
       : {}),

@@ -59,15 +59,51 @@ function scanCommentsForPreviewUrl(comments: PrInfo["comments"]): string | undef
   return undefined;
 }
 
+/**
+ * Slug a branch name into a URL-safe DNS label: lowercase, replace any run of
+ * non-[a-z0-9] with "-", trim leading/trailing dashes, cap at 63 chars (DNS
+ * label limit). Branches like "feature/foo bar" become "feature-foo-bar".
+ */
+function slugForUrl(raw: string): string {
+  return raw
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 63);
+}
+
 function applyTemplate(
   template: string,
   vars: { number: number; branch: string },
 ): string {
+  const safeBranch = slugForUrl(vars.branch);
   return template
     .replace(/\{number\}/g, String(vars.number))
     .replace(/\{pr\}/g, String(vars.number))
-    .replace(/\{branch\}/g, vars.branch)
-    .replace(/\{ref\}/g, vars.branch);
+    .replace(/\{branch\}/g, safeBranch)
+    .replace(/\{ref\}/g, safeBranch);
+}
+
+/**
+ * Validate a resolved PR preview URL. Accept only http(s) + a reasonable
+ * hostname; reject anything that parses funny so a hostile branch name can't
+ * turn the template into javascript:/file:/etc.
+ */
+function validatePreviewUrl(raw: string): void {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    throw new Error(`resolved PR preview URL is not a valid URL: ${raw}`);
+  }
+  if (u.protocol !== "https:" && u.protocol !== "http:") {
+    throw new Error(
+      `resolved PR preview URL has disallowed protocol ${u.protocol} (only http/https permitted): ${raw}`,
+    );
+  }
+  if (!/^[a-z0-9.-]+$/i.test(u.hostname)) {
+    throw new Error(`resolved PR preview URL has malformed host ${u.hostname}: ${raw}`);
+  }
 }
 
 export interface ResolvePrUrlResult {
@@ -105,11 +141,13 @@ export async function resolvePrUrl(
   // 1. Project-level template.
   const cfg = await readConfig(cwd);
   if (cfg.pr_url_template) {
+    const url = applyTemplate(cfg.pr_url_template, {
+      number: info.number,
+      branch: info.headRefName,
+    });
+    validatePreviewUrl(url);
     return {
-      url: applyTemplate(cfg.pr_url_template, {
-        number: info.number,
-        branch: info.headRefName,
-      }),
+      url,
       source: "config-template",
       prNumber: info.number,
       branch: info.headRefName,
@@ -119,6 +157,7 @@ export async function resolvePrUrl(
   // 2. Scan PR comments for known preview-URL patterns.
   const scanned = scanCommentsForPreviewUrl(info.comments);
   if (scanned) {
+    validatePreviewUrl(scanned);
     return {
       url: scanned,
       source: "comment-scan",

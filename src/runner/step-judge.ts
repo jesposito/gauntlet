@@ -29,6 +29,7 @@ export interface JudgeContext {
     action?: string;
     error?: string;
   };
+  signal?: AbortSignal;
 }
 
 export async function judgeStep(ctx: JudgeContext): Promise<StepVerdict> {
@@ -82,5 +83,6 @@ Verdict?`,
     schemaName: "StepVerdict",
     maxTokens: 400,
     temperature: 0,
+    ...(ctx.signal ? { signal: ctx.signal } : {}),
   });
 }

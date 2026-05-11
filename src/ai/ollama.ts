@@ -37,6 +37,7 @@ class OllamaProvider implements AiProvider {
         format: "json",
         options: { temperature: opts.temperature ?? 0.7 },
       }),
+      ...(opts.signal ? { signal: opts.signal } : {}),
     });
     if (!res.ok) throw new Error(`ollama ${res.status}: ${await res.text()}`);
     const json = (await res.json()) as OllamaResponse;
