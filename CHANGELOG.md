@@ -8,6 +8,25 @@ The format roughly follows [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Added
 
+- **Cross-surface report.** New `gauntlet cross-report [--surfaces <ids>]
+  [--runs <dirs>]` aggregates the latest run per curated surface and
+  surfaces the signatures that span ≥2 surfaces — the highest-leverage
+  fixes (a `color-contrast` hit on marketing + admin + portfolio is one
+  design-system token, not three separate bugs). Writes
+  `.gauntlet/CROSS-REPORT.md` + `.gauntlet/cross-report.json`.
+  Falls back to `.gauntlet/personas/<id>.yaml` `surface:` field when
+  flow-result.json lacks a surface (pre-surface runs).
+- **External-resource noise filter.** Console errors that reference a
+  host outside the page's registrable domain (Google Fonts, third-party
+  CDNs, etc) get tagged with `metadata.externalHost` and are downgraded
+  to severity=minor in the report. Stops drowning real product findings
+  in fonts.googleapis.com noise.
+- **AI cache hit-rate stats.** `gauntlet run` summary now shows
+  `cache: hits=N misses=N writes=N (P% hit-rate)` so it's obvious whether
+  a fast run is real or replayed.
+- **`flow-result.json` includes surface.** Run output captures the
+  surface id when known, so cross-surface tooling no longer has to guess.
+
 - **Surfaces.** A product is no longer modelled as a single URL. `gauntlet
   init` now produces `.gauntlet/surfaces/<id>.yaml` describing each
   distinct audience-scoped view (marketing, tenant portfolio, tenant

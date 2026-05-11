@@ -166,7 +166,17 @@ export async function buildPersonaReport(
           : undefined;
       const axeImpactMatch = failure.message.match(/^axe\[(\w+)\]/);
       const axeImpact = axeImpactMatch?.[1];
-      const severity = bumpSeverityForAxe(failure.reason, axeImpact);
+      let severity = bumpSeverityForAxe(failure.reason, axeImpact);
+      const externalHost =
+        typeof failure.metadata?.externalHost === "string"
+          ? (failure.metadata.externalHost as string)
+          : undefined;
+      // Downgrade console errors that originate from external hosts (CDNs,
+      // fonts, etc) to "minor" — they're real signal but they're a noise
+      // floor that drowns out actual product findings.
+      if (failure.reason === FailureReason.CONSOLE_ERROR && externalHost) {
+        severity = "minor";
+      }
 
       // For axe findings, dedup across steps (same rule + url = same bug).
       // For other failures, key on step to keep distinct occurrences.

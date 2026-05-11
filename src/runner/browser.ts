@@ -19,6 +19,7 @@ import {
 } from "./capture.ts";
 import { FailureReason, type FailureEvent } from "./failure-reasons.ts";
 import { matchAxeViolationsToPersonaRules } from "./axe-scan.ts";
+import { detectExternalHost } from "./external-host.ts";
 
 const DEVICE_USER_AGENTS: Record<string, string> = {
   desktop:
@@ -99,12 +100,15 @@ export async function runPersona(opts: RunOptions): Promise<RunResult> {
     };
     consoleLog.push(JSON.stringify(entry));
     if (msg.type() === "error") {
+      const text = msg.text();
+      const externalHost = detectExternalHost(text, page.url());
       failures.push({
         reason: FailureReason.CONSOLE_ERROR,
-        message: msg.text(),
+        message: text,
         timestamp: Date.now(),
         stepIndex: -1,
         url: page.url(),
+        ...(externalHost ? { metadata: { externalHost } } : {}),
       });
     }
   });

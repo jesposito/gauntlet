@@ -12,8 +12,9 @@ import { runWithConcurrency } from "./util/pool.ts";
 import { loadAllSurfaces, loadSurface, writeSurface } from "./surface/loader.ts";
 import { captureAuth, resolveAuthStatePath } from "./auth/capture.ts";
 import { buildReport, findLatestRunDir } from "./report/build.ts";
+import { buildCrossSurfaceReport } from "./report/cross-surface.ts";
 import { DEFAULT_MODEL, pickProvider } from "./ai/index.ts";
-import { configureAiCache } from "./ai/cache.ts";
+import { configureAiCache, getAiCache } from "./ai/cache.ts";
 import { readProject } from "./init/project-reader.ts";
 import { loadTemplates } from "./persona/templates.ts";
 import {
@@ -208,6 +209,7 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
     persona: Awaited<ReturnType<typeof loadPersona>>;
     flows: Awaited<ReturnType<typeof loadFlowsForPersona>>;
     storageStatePath?: string;
+    surfaceId?: string;
   };
   const plans: Plan[] = [];
   let totalDroppedByFilter = 0;
@@ -241,7 +243,12 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
         );
       }
     }
-    plans.push({ persona, flows, ...(storageStatePath ? { storageStatePath } : {}) });
+    plans.push({
+      persona,
+      flows,
+      ...(storageStatePath ? { storageStatePath } : {}),
+      ...(effectiveSurfaceId ? { surfaceId: effectiveSurfaceId } : {}),
+    });
   }
   if (filterIsActive) {
     const totalKept = plans.reduce((n, p) => n + p.flows.length, 0);
@@ -291,7 +298,7 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
   type PersonaResult = { persona: string; flows: number; failures: number; outcomes: string[] };
 
   const personaResults = await runWithConcurrency<typeof plans[number], PersonaResult>(plans, concurrency, async (plan) => {
-    const { persona, flows, storageStatePath } = plan;
+    const { persona, flows, storageStatePath, surfaceId } = plan;
     const authSuffix = storageStatePath ? ` (authed)` : "";
     if (flows.length === 0) {
       const runDir = join(baseDir, persona.id);
@@ -329,6 +336,7 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
           headless,
           onEvent: logEvent,
           ...(storageStatePath ? { storageStatePath } : {}),
+          ...(surfaceId ? { surfaceId } : {}),
         });
         totalFailures += result.failures.length;
         outcomes.push(result.outcome);
@@ -356,6 +364,7 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
               persona: persona.id,
               flow: flow.id,
               url,
+              ...(surfaceId ? { surface: surfaceId } : {}),
               outcome: "error",
               outcomeReason: `flow runner threw: ${firstLine}`,
               steps: [],
@@ -402,6 +411,15 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
     `\nsummary: personas=${personaResults.length} flows=${totalFlows} failures=${totalFailures} [${outcomeSummary || "no outcomes"}]`,
   );
 
+  // Cache transparency: shows whether a fast run was real or replayed.
+  const cache = getAiCache();
+  if (cache?.enabled) {
+    const s = cache.stats();
+    const total = s.hits + s.misses;
+    const pct = total > 0 ? Math.round((s.hits / total) * 100) : 0;
+    console.log(`cache: hits=${s.hits} misses=${s.misses} writes=${s.writes} (${pct}% hit-rate)`);
+  }
+
   // Detect "every flow crashed for the same reason" — almost always a setup
   // problem (bad API key, network, missing surface yaml), not a real finding.
   const errorCount = outcomeCounts.error ?? 0;
@@ -443,6 +461,30 @@ async function cmdReport(args: ParsedArgs): Promise<void> {
     console.log(`\ncross-persona patterns:`);
     for (const p of built.report.patterns.slice(0, 5)) {
       console.log(`  ${p.signature.padEnd(50)} ${p.count}x (${p.personas.join(", ")})`);
+    }
+  }
+}
+
+async function cmdCrossReport(args: ParsedArgs): Promise<void> {
+  const cwd = process.cwd();
+  const explicitRuns = splitCsv(args.flags.runs);
+  const surfaceIds = splitCsv(args.flags.surfaces);
+  const opts: Parameters<typeof buildCrossSurfaceReport>[0] = { cwd };
+  if (explicitRuns.length > 0) opts.runDirs = explicitRuns;
+  if (surfaceIds.length > 0) opts.surfaceIds = surfaceIds;
+
+  const built = await buildCrossSurfaceReport(opts);
+  console.log(`gauntlet cross-report`);
+  console.log(`  surfaces:  ${built.report.surfaces.length}`);
+  console.log(`  unique:    ${built.report.totalUniqueSignatures}`);
+  console.log(`  patterns:  ${built.report.patterns.length} (signatures present on >=2 surfaces)`);
+  console.log("");
+  console.log(`markdown: ${built.markdownPath}`);
+  console.log(`json:     ${built.jsonPath}`);
+  if (built.report.patterns.length > 0) {
+    console.log(`\ntop cross-surface patterns:`);
+    for (const p of built.report.patterns.slice(0, 8)) {
+      console.log(`  ${p.signature.padEnd(28)} ${p.surfaces.length} surfaces, ${p.totalCount} findings (${p.surfaces.join(", ")})`);
     }
   }
 }
@@ -690,6 +732,7 @@ usage:
   gauntlet report [<run-dir>] [--run <path>] [--no-vet]
   gauntlet surfaces
   gauntlet auth <surface-id> [--url <login-url>]
+  gauntlet cross-report [--surfaces <ids>] [--runs <dirs>]
   gauntlet list
   gauntlet help
 
@@ -775,6 +818,9 @@ async function main(): Promise<void> {
       break;
     case "auth":
       await cmdAuth(args);
+      break;
+    case "cross-report":
+      await cmdCrossReport(args);
       break;
     case "list":
       await cmdList();

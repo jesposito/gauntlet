@@ -40,9 +40,18 @@ export interface AiCacheOptions {
   cwd: string;
 }
 
+export interface AiCacheStats {
+  hits: number;
+  misses: number;
+  writes: number;
+}
+
 export class AiCache {
   readonly enabled: boolean;
   readonly dir: string;
+  private hits = 0;
+  private misses = 0;
+  private writes = 0;
 
   constructor(opts: AiCacheOptions) {
     this.enabled = opts.enabled;
@@ -53,14 +62,20 @@ export class AiCache {
     return join(this.dir, `${hash}.json`);
   }
 
+  stats(): AiCacheStats {
+    return { hits: this.hits, misses: this.misses, writes: this.writes };
+  }
+
   async get<T>(inputs: CacheKeyInputs): Promise<T | undefined> {
     if (!this.enabled) return undefined;
     const hash = hashKey(inputs);
     try {
       const raw = await readFile(this.pathFor(hash), "utf8");
       const entry = JSON.parse(raw) as CacheEntry<T>;
+      this.hits += 1;
       return entry.output;
     } catch {
+      this.misses += 1;
       return undefined;
     }
   }
@@ -76,6 +91,7 @@ export class AiCache {
       output,
     };
     await writeFile(this.pathFor(hash), JSON.stringify(entry, null, 2), "utf8");
+    this.writes += 1;
   }
 
   inputsFor(provider: string, model: string, opts: ProposeOptions<unknown>): CacheKeyInputs {

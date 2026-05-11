@@ -15,6 +15,7 @@ import {
 } from "./capture.ts";
 import { FailureReason, type FailureEvent } from "./failure-reasons.ts";
 import { matchAxeViolationsToPersonaRules } from "./axe-scan.ts";
+import { detectExternalHost } from "./external-host.ts";
 import { act, observe } from "../agent/actions.ts";
 import { judgeStep, type StepVerdict } from "./step-judge.ts";
 
@@ -67,6 +68,7 @@ export interface FlowRunOptions {
   headless?: boolean;
   onEvent?: FlowEventHandler;
   storageStatePath?: string;
+  surfaceId?: string;
 }
 
 export interface StepResult {
@@ -158,12 +160,15 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
       }),
     );
     if (msg.type() === "error") {
+      const text = msg.text();
+      const externalHost = detectExternalHost(text, page.url());
       failures.push({
         reason: FailureReason.CONSOLE_ERROR,
-        message: msg.text(),
+        message: text,
         timestamp: Date.now(),
         stepIndex: stepResults.length,
         url: page.url(),
+        ...(externalHost ? { metadata: { externalHost } } : {}),
       });
     }
   });
@@ -445,6 +450,7 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
         flow: flow.id,
         url,
         startUrl,
+        ...(opts.surfaceId ? { surface: opts.surfaceId } : {}),
         startedAt,
         finishedAt: Date.now(),
         outcome,
