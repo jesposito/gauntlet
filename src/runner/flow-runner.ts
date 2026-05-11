@@ -223,6 +223,12 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
 
   try {
     await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
+    // SPAs render a near-empty shell at DOMContentLoaded and only hydrate the
+    // real navigation/content after JS runs. Wait briefly for networkidle so
+    // the first observe() sees the actual page, not a skip-link-only stub.
+    await page
+      .waitForLoadState("networkidle", { timeout: 8_000 })
+      .catch(() => undefined);
   } catch (err) {
     outcome = "error";
     outcomeReason = `navigation failed: ${err instanceof Error ? err.message : String(err)}`;
