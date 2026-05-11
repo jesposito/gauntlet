@@ -52,13 +52,15 @@ class AnthropicProvider implements AiProvider {
       last.content = `${last.content}${schemaHint ? `\n\n${schemaHint}` : ""}`;
     }
 
-    const body = {
+    const body: Record<string, unknown> = {
       model: this.model,
       max_tokens: opts.maxTokens ?? 4096,
-      temperature: opts.temperature ?? 0.7,
       system: system || undefined,
       messages: turns,
     };
+    if (opts.temperature !== undefined && !/opus-4-[789]|sonnet-4-[6789]/.test(this.model)) {
+      body.temperature = opts.temperature;
+    }
 
     const res = await fetch(API_URL, {
       method: "POST",

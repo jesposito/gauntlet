@@ -15,6 +15,35 @@ const CandidateSetSchema = z.object({
   candidates: z.array(PersonaCandidateSchema).min(4).max(16),
 });
 
+const SCHEMA_EXAMPLE = `{
+  "candidates": [
+    {
+      "id": "kebab-case-id",
+      "label": "core" | "edge",
+      "template_id": "low-digital-confidence",
+      "rationale": "One sentence: why this persona is a useful stress test for this product.",
+      "character": {
+        "name": "Full Name",
+        "age": 34,
+        "context": "1-2 sentences: who they are and what they want from THIS product.",
+        "voice": "How they talk when frustrated or pleased."
+      },
+      "behavior": {
+        "goals": ["Concrete task 1 specific to this product", "Concrete task 2"],
+        "device": "desktop" | "laptop" | "tablet" | "mobile",
+        "viewport": { "width": 1440, "height": 900 },
+        "network": "fast-fiber" | "home-wifi" | "slow-3g" | "fast-3g" | "offline-flaky",
+        "input": "mouse" | "touch" | "keyboard-only" | "screen-reader",
+        "patience_threshold_seconds": 30,
+        "reading_level": "3rd_grade" | "6th_grade" | "9th_grade" | "college",
+        "avoids": ["modals", "..."],
+        "abandons_on": ["..."],
+        "prefers": ["..."]
+      }
+    }
+  ]
+}`;
+
 const SYSTEM_PROMPT = `You are a UX research lead helping a developer pick a roster of personas to stress-test their product with.
 
 You will be given:
@@ -30,7 +59,15 @@ Rules:
 - behavior.goals must be specific to THIS product, not generic
 - ids must be lowercase kebab-case, unique
 - rationale: one sentence explaining why this persona is a useful stress test for this product
-- Output only the JSON object matching the schema; no prose.`;
+- Output ONLY a JSON object exactly matching the schema below; no prose, no markdown fences.
+
+CRITICAL: field names must match EXACTLY. Required behavior fields:
+goals, device, viewport (with width and height), network, input,
+patience_threshold_seconds (NOT "patience_seconds"), reading_level, avoids,
+abandons_on, prefers.
+
+Example shape:
+${SCHEMA_EXAMPLE}`;
 
 export interface GenerateOptions {
   provider: AiProvider;
