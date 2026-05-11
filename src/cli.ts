@@ -8,6 +8,7 @@ import {
 } from "./persona/loader.ts";
 import { runPersona } from "./runner/browser.ts";
 import { runFlow } from "./runner/flow-runner.ts";
+import { buildReport, findLatestRunDir } from "./report/build.ts";
 import { DEFAULT_MODEL, pickProvider } from "./ai/index.ts";
 import { configureAiCache } from "./ai/cache.ts";
 import { readProject } from "./init/project-reader.ts";
@@ -146,6 +147,39 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
   }
 
   console.log(`\nartifacts: ${baseDir}`);
+
+  const skipReport = args.flags["no-report"] === true;
+  if (!skipReport) {
+    console.log(`\nbuilding report (vetting layer re-runs replays)...`);
+    const built = await buildReport({ runDir: baseDir, vet: true });
+    console.log(
+      `report: ${built.markdownPath}  (findings=${built.report.totals.findings} verified=${built.report.totals.verified} subjective=${built.report.totals.subjective} regressed=${built.report.totals.regressed})`,
+    );
+  }
+}
+
+async function cmdReport(args: ParsedArgs): Promise<void> {
+  const cwd = process.cwd();
+  const target =
+    typeof args.flags.run === "string"
+      ? args.flags.run
+      : args.positional[0] ?? (await findLatestRunDir(cwd));
+  if (!target) {
+    console.error("error: no run directory found. pass --run <path> or run gauntlet first.");
+    process.exit(2);
+  }
+  const skipVet = args.flags["no-vet"] === true;
+  console.log(`gauntlet report -> ${target}${skipVet ? " (vetting disabled)" : ""}`);
+  const built = await buildReport({ runDir: target, vet: !skipVet });
+  console.log(
+    `\nreport: ${built.markdownPath}\njson:   ${built.jsonPath}\nfindings=${built.report.totals.findings} verified=${built.report.totals.verified} subjective=${built.report.totals.subjective} regressed=${built.report.totals.regressed} could_not_replay=${built.report.totals.couldNotReplay} unverified=${built.report.totals.unverified}`,
+  );
+  if (built.report.patterns.length > 0) {
+    console.log(`\ncross-persona patterns:`);
+    for (const p of built.report.patterns.slice(0, 5)) {
+      console.log(`  ${p.signature.padEnd(50)} ${p.count}x (${p.personas.join(", ")})`);
+    }
+  }
 }
 
 async function cmdList(): Promise<void> {
@@ -324,6 +358,7 @@ usage:
   gauntlet init [--url <url>] [--model <id>] [--count N]
   gauntlet flows [--personas <id[,id...]>] [--model <id>] [--count N] [--url <url>]
   gauntlet run <url> --personas <id[,id...]> [--steps N] [--headed]
+  gauntlet report [<run-dir>] [--run <path>] [--no-vet]
   gauntlet list
   gauntlet help
 
@@ -347,6 +382,11 @@ run flags:
   --model <id>       AI model for in-flow actions (default ${DEFAULT_MODEL})
   --no-cache         disable AI response cache
   --no-flows         force legacy single-step capture even if flows exist
+  --no-report        skip post-run report build
+
+report flags:
+  --run <path>       path to a run directory (default: latest under .gauntlet/runs/)
+  --no-vet           skip replay vetting (faster, but findings stay unverified)
 `);
 }
 
@@ -361,6 +401,9 @@ async function main(): Promise<void> {
       break;
     case "flows":
       await cmdFlows(args);
+      break;
+    case "report":
+      await cmdReport(args);
       break;
     case "list":
       await cmdList();
