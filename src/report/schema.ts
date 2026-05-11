@@ -57,7 +57,7 @@ export const PersonaReportSchema = z.object({
     z.object({
       flowId: z.string(),
       title: z.string(),
-      outcome: z.enum(["completed", "abandoned", "patience_exceeded", "error"]),
+      outcome: z.enum(["completed", "abandoned", "patience_exceeded", "timeout", "error"]),
       outcomeReason: z.string().optional(),
       steps: z.number().int(),
       durationMs: z.number().int(),

@@ -4,6 +4,60 @@ All notable changes to Gauntlet are documented in this file.
 
 The format roughly follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Added
+
+- **Surfaces.** A product is no longer modelled as a single URL. `gauntlet
+  init` now produces `.gauntlet/surfaces/<id>.yaml` describing each
+  distinct audience-scoped view (marketing, tenant portfolio, tenant
+  admin, ops admin, etc). Personas can be tagged with a `surface`.
+  `gauntlet run --surface <id>` auto-selects every persona on that
+  surface and uses `surface.base_url`. `gauntlet surfaces` lists curated
+  surfaces.
+- **Multi-URL discovery.** `gauntlet init --url <a> <b> ...` fetches each
+  landing and feeds all of them to the AI surface generator. Pages that
+  401 / 403 or look like login walls are flagged with a `hint` so the AI
+  reasons about auth-walled surfaces from evidence rather than README
+  hand-waving.
+- **Auth state for behind-login surfaces.** Surfaces gain
+  `requires_auth`, `auth_state`, `login_url`. `gauntlet auth <surface-id>`
+  opens headed Chromium, waits for the user to log in and press Enter,
+  saves Playwright `storageState` to `.gauntlet/auth/<id>.json`, and
+  writes the path back into the surface yaml. `gauntlet run` resolves
+  that file per persona's surface and passes `storageState` to
+  `newContext`, so subsequent navigation is authed.
+- **Flexible `gauntlet run` targeting.** New target sources and filters:
+  - `--pr <num>` resolves the preview URL from a configurable
+    `.gauntlet/config.json` `pr_url_template` or by scanning PR comments
+    for Vercel / Netlify / Render / Cloudflare Pages / Fly preview URLs.
+  - `--flows / --features / --tags / --exclude-tags / --paths` compose
+    with AND (`--tags` is OR within group). Flow schema gains optional
+    `feature`, `tags`, `paths` fields. AI flow generator populates them
+    when the surface declares its features.
+
+### Fixed
+
+- **Step operations no longer hang the run.** Every AI call in the flow
+  loop (`observe`, `act`, `captureStep`, `judgeStep`, including the
+  previously-unwrapped `captureStep` in the observe-give_up branch) is
+  now bounded by a 60s `withTimeout`. On timeout the flow ends
+  `outcome=timeout` (new variant) and the pool slot is freed. Previously
+  a hung Playwright operation could keep the run alive indefinitely with
+  no `flow_end` event.
+- **Browser cleanup can't hang the run.** `context.close()` and
+  `browser.close()` are wrapped with an 8s timeout each; failure is
+  swallowed so a wedged Chromium process is preferable to a hung run.
+- **Per-flow exception isolation.** `cmdRun` now wraps each `runFlow` in
+  try/catch. A single Playwright `Target page, context or browser has
+  been closed` exception no longer kills the entire concurrent pool;
+  the crashed flow is written as `outcome=error` with a synthetic
+  `uncaught_exception` failure so it still appears in the report.
+- **End-of-run summary line.** `gauntlet run` prints a per-outcome tally
+  before the report build step, plus a warning when every flow ended
+  `outcome=error` (almost always a credential / network setup issue, not
+  a real product finding).
+
 ## 0.1.0 — 2026-05-11
 
 First end-to-end release. All six phases of the gated pipeline are now wired

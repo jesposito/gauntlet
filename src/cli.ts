@@ -290,7 +290,7 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
 
   type PersonaResult = { persona: string; flows: number; failures: number; outcomes: string[] };
 
-  await runWithConcurrency<typeof plans[number], PersonaResult>(plans, concurrency, async (plan) => {
+  const personaResults = await runWithConcurrency<typeof plans[number], PersonaResult>(plans, concurrency, async (plan) => {
     const { persona, flows, storageStatePath } = plan;
     const authSuffix = storageStatePath ? ` (authed)` : "";
     if (flows.length === 0) {
@@ -336,9 +336,19 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
         // A single flow crashing must not abort the whole run. Mark it
         // as outcome=error, surface the message, continue with the next flow.
         const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[${persona.id}/${flow.id}] flow crashed: ${msg.split("\n")[0]}`);
+        const firstLine = msg.split("\n")[0] ?? msg;
+        console.error(`[${persona.id}/${flow.id}] flow crashed: ${firstLine}`);
+        logEvent({
+          type: "flow_end",
+          personaId: persona.id,
+          flowId: flow.id,
+          outcome: "error",
+          durationMs: 0,
+        });
         outcomes.push("error");
+        totalFailures += 1;
         await mkdir(runDir, { recursive: true });
+        const now = Date.now();
         await Bun.write(
           join(runDir, "flow-result.json"),
           JSON.stringify(
@@ -347,11 +357,19 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
               flow: flow.id,
               url,
               outcome: "error",
-              outcomeReason: `flow runner threw: ${msg}`,
+              outcomeReason: `flow runner threw: ${firstLine}`,
               steps: [],
-              failures: [],
-              startedAt: Date.now(),
-              finishedAt: Date.now(),
+              failures: [
+                {
+                  reason: "uncaught_exception",
+                  message: `flow runner threw: ${msg}`,
+                  timestamp: now,
+                  stepIndex: -1,
+                  url,
+                },
+              ],
+              startedAt: now,
+              finishedAt: now,
               durationMs: 0,
             },
             null,
@@ -362,6 +380,36 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
     }
     return { persona: persona.id, flows: flows.length, failures: totalFailures, outcomes };
   });
+
+  // End-of-run summary: per-persona flow outcomes + aggregate.
+  const allOutcomes: string[] = [];
+  let totalFlows = 0;
+  let totalFailures = 0;
+  for (const r of personaResults) {
+    allOutcomes.push(...r.outcomes);
+    totalFlows += r.flows;
+    totalFailures += r.failures;
+  }
+  const outcomeCounts = allOutcomes.reduce<Record<string, number>>((acc, o) => {
+    acc[o] = (acc[o] ?? 0) + 1;
+    return acc;
+  }, {});
+  const outcomeSummary = Object.entries(outcomeCounts)
+    .sort(([, a], [, b]) => b - a)
+    .map(([k, v]) => `${k}=${v}`)
+    .join(" ");
+  console.log(
+    `\nsummary: personas=${personaResults.length} flows=${totalFlows} failures=${totalFailures} [${outcomeSummary || "no outcomes"}]`,
+  );
+
+  // Detect "every flow crashed for the same reason" — almost always a setup
+  // problem (bad API key, network, missing surface yaml), not a real finding.
+  const errorCount = outcomeCounts.error ?? 0;
+  if (totalFlows > 0 && errorCount === totalFlows) {
+    console.error(
+      `\nwarn: every flow ended outcome=error. Check the log above for the underlying cause (often a credential or network issue, not a real finding).`,
+    );
+  }
 
   console.log(`\nartifacts: ${baseDir}`);
 

@@ -17,7 +17,7 @@ interface FlowResultFile {
   startUrl?: string;
   startedAt: number;
   finishedAt: number;
-  outcome: "completed" | "abandoned" | "patience_exceeded" | "error";
+  outcome: "completed" | "abandoned" | "patience_exceeded" | "timeout" | "error";
   outcomeReason?: string;
   steps: Array<{
     stepIndex: number;
