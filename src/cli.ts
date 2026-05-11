@@ -7,6 +7,7 @@ import {
   listCuratedPersonas,
 } from "./persona/loader.ts";
 import { runPersona } from "./runner/browser.ts";
+import { runFlow } from "./runner/flow-runner.ts";
 import { DEFAULT_MODEL, pickProvider } from "./ai/index.ts";
 import { configureAiCache } from "./ai/cache.ts";
 import { readProject } from "./init/project-reader.ts";
@@ -76,28 +77,70 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
     .filter((s: string): s is string => Boolean(s));
   const headless = args.flags.headless !== "false" && args.flags.headed !== true;
   const maxSteps = args.flags.steps ? Number(args.flags.steps) : 1;
+  const cacheEnabled = args.flags["no-cache"] !== true;
+  const model =
+    typeof args.flags.model === "string" ? args.flags.model : DEFAULT_MODEL;
+  const forceLegacy = args.flags["no-flows"] === true;
+
+  const cwd = process.cwd();
+  configureAiCache({ enabled: cacheEnabled, cwd });
 
   const ts = new Date().toISOString().replace(/[:.]/g, "-");
-  const baseDir = join(process.cwd(), ".gauntlet", "runs", ts);
+  const baseDir = join(cwd, ".gauntlet", "runs", ts);
   await mkdir(baseDir, { recursive: true });
 
   console.log(`gauntlet run -> ${url}`);
   console.log(`personas: ${personaIds.join(", ")}`);
   console.log(`run dir: ${baseDir}`);
 
+  let providerLazy: ReturnType<typeof pickProvider> | undefined;
+  const getProvider = (): ReturnType<typeof pickProvider> => {
+    if (!providerLazy) providerLazy = pickProvider(model);
+    return providerLazy;
+  };
+
   for (const id of personaIds) {
     if (!id) continue;
-    const persona = await loadPersona(id);
-    const runDir = join(baseDir, persona.id);
-    console.log(`\n[${persona.id}] ${persona.character.name} -> ${url}`);
-    const result = await runPersona({ url, persona, runDir, maxSteps, headless });
+    const persona = await loadPersona(id, cwd);
+    const flows = forceLegacy ? [] : await loadFlowsForPersona(id, cwd);
+
+    if (flows.length === 0) {
+      const runDir = join(baseDir, persona.id);
+      console.log(
+        `\n[${persona.id}] ${persona.character.name} -> ${url} (no flows; legacy single-step capture)`,
+      );
+      const result = await runPersona({ url, persona, runDir, maxSteps, headless });
+      console.log(
+        `[${persona.id}] done. steps=${result.steps} failures=${result.failures.length} duration=${result.durationMs}ms`,
+      );
+      continue;
+    }
+
     console.log(
-      `[${persona.id}] done. steps=${result.steps} failures=${result.failures.length} duration=${result.durationMs}ms`,
+      `\n[${persona.id}] ${persona.character.name} -> ${url} (${flows.length} flow${flows.length === 1 ? "" : "s"})`,
     );
-    if (result.failures.length > 0) {
-      console.log(`[${persona.id}] failure summary:`);
-      for (const f of result.failures.slice(0, 5)) {
-        console.log(`  - ${f.reason}: ${f.message.slice(0, 120)}`);
+    for (const flow of flows) {
+      const runDir = join(baseDir, persona.id, flow.id);
+      console.log(`  flow: ${flow.id} (${flow.steps.length} steps) - ${flow.title}`);
+      const result = await runFlow({
+        url,
+        persona,
+        flow,
+        provider: getProvider(),
+        runDir,
+        headless,
+      });
+      const stepSummary = result.steps
+        .map((s) => `${s.stepIndex + 1}:${s.verdict.status[0]}`)
+        .join(" ");
+      console.log(
+        `    outcome=${result.outcome} steps=[${stepSummary}] failures=${result.failures.length} duration=${result.durationMs}ms`,
+      );
+      if (result.outcomeReason) console.log(`    why: ${result.outcomeReason}`);
+      if (result.failures.length > 0) {
+        for (const f of result.failures.slice(0, 3)) {
+          console.log(`      - ${f.reason}: ${f.message.slice(0, 140)}`);
+        }
       }
     }
   }
@@ -299,8 +342,11 @@ flows flags:
 
 run flags:
   --personas <ids>   comma-separated persona ids
-  --steps <n>        number of capture steps per persona (default 1)
+  --steps <n>        legacy single-step capture step count (default 1)
   --headed           run browser visibly (default headless)
+  --model <id>       AI model for in-flow actions (default ${DEFAULT_MODEL})
+  --no-cache         disable AI response cache
+  --no-flows         force legacy single-step capture even if flows exist
 `);
 }
 
