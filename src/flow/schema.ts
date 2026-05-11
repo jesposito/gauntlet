@@ -46,6 +46,26 @@ export const FlowSchema = z.object({
   rationale: z
     .string()
     .describe("One sentence: why this flow stress-tests something useful."),
+  feature: z
+    .string()
+    .nullable()
+    .optional()
+    .transform((v) => v ?? undefined)
+    .describe(
+      "Single capability this flow exercises (e.g. 'checkout', 'signup', 'search'). Used by --features filter. Should match a surface.features entry when applicable.",
+    ),
+  tags: z
+    .array(z.string())
+    .default([])
+    .describe(
+      "Free-form labels (e.g. 'smoke', 'critical', 'mobile-only'). Used by --tags / --exclude-tags filters.",
+    ),
+  paths: z
+    .array(z.string())
+    .default([])
+    .describe(
+      "URL path patterns this flow exercises (e.g. '/checkout/*', '/api/cart'). Reserved for future diff-aware filtering.",
+    ),
 });
 
 export type Flow = z.infer<typeof FlowSchema>;

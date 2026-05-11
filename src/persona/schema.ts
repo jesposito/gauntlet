@@ -81,6 +81,12 @@ export const PersonaSchema = z.object({
   }),
   character: CharacterSchema,
   behavior: BehaviorSchema,
+  surface: z
+    .string()
+    .optional()
+    .describe(
+      "Surface id this persona belongs to (e.g. 'marketing', 'customer-portfolio'). Optional for legacy personas.",
+    ),
   analytics_grounding: z
     .string()
     .optional()

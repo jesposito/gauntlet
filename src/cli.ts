@@ -9,6 +9,7 @@ import {
 import { runPersona } from "./runner/browser.ts";
 import { runFlow, type FlowEvent } from "./runner/flow-runner.ts";
 import { runWithConcurrency } from "./util/pool.ts";
+import { loadAllSurfaces, loadSurface } from "./surface/loader.ts";
 import { buildReport, findLatestRunDir } from "./report/build.ts";
 import { DEFAULT_MODEL, pickProvider } from "./ai/index.ts";
 import { configureAiCache } from "./ai/cache.ts";
@@ -22,6 +23,8 @@ import { curate, listCuratedIds } from "./init/curate.ts";
 import { generateFlows } from "./init/flow-generator.ts";
 import { curateFlows } from "./init/curate-flows.ts";
 import { listFlows, loadFlowsForPersona } from "./flow/loader.ts";
+import { filterFlows, describeCriteria, type FlowFilterCriteria } from "./flow/filter.ts";
+import { resolvePrUrl } from "./target/pr.ts";
 
 interface ParsedArgs {
   command: string;
@@ -58,25 +61,65 @@ function parseArgs(argv: string[]): ParsedArgs {
   return { command, positional, flags };
 }
 
+function splitCsv(v: string | boolean | undefined): string[] {
+  if (typeof v !== "string") return [];
+  return v.split(",").map((s) => s.trim()).filter(Boolean);
+}
+
 async function cmdRun(args: ParsedArgs): Promise<void> {
-  const url = args.positional[0];
+  const surfaceArg = typeof args.flags.surface === "string" ? args.flags.surface : undefined;
+  const prArg = typeof args.flags.pr === "string" ? args.flags.pr : undefined;
+  let url = args.positional[0] ?? (typeof args.flags.url === "string" ? args.flags.url : undefined);
+  let prInfo: Awaited<ReturnType<typeof resolvePrUrl>> | undefined;
+
+  if (prArg) {
+    try {
+      prInfo = await resolvePrUrl(prArg, process.cwd());
+      if (!url) url = prInfo.url;
+    } catch (err) {
+      console.error(`error: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(2);
+    }
+  }
+
+  if (surfaceArg && !url) {
+    try {
+      const surface = await loadSurface(surfaceArg);
+      if (surface.base_url) url = surface.base_url;
+      else {
+        console.error(`error: surface "${surfaceArg}" has no base_url; pass <url> explicitly.`);
+        process.exit(2);
+      }
+    } catch (err) {
+      console.error(`error: cannot load surface "${surfaceArg}": ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(2);
+    }
+  }
+
   if (!url) {
     console.error("error: missing URL");
-    console.error("usage: gauntlet run <url> --personas mary [devon ...]");
+    console.error("usage: gauntlet run <url> --personas mary [...]");
+    console.error("       gauntlet run --surface marketing --personas ...");
+    console.error("       gauntlet run --pr 123 [--features checkout]");
     process.exit(2);
   }
 
   const personaArg = args.flags.personas;
   if (!personaArg || personaArg === true) {
-    console.error("error: --personas required");
-    console.error("available:", (await listBuiltinPersonas()).join(", "));
-    process.exit(2);
+    // If a surface is selected, default to every curated persona on that surface.
+    if (surfaceArg) {
+      // resolved below via plan loading
+    } else {
+      console.error("error: --personas required");
+      console.error("available:", (await listBuiltinPersonas()).join(", "));
+      process.exit(2);
+    }
   }
 
-  const personaIds = String(personaArg)
-    .split(",")
-    .map((s: string) => s.trim())
-    .filter((s: string): s is string => Boolean(s));
+  let personaIds: string[] =
+    personaArg && personaArg !== true
+      ? String(personaArg).split(",").map((s) => s.trim()).filter((s): s is string => Boolean(s))
+      : [];
   const headless = args.flags.headless !== "false" && args.flags.headed !== true;
   const maxSteps = args.flags.steps ? Number(args.flags.steps) : 1;
   const cacheEnabled = args.flags["no-cache"] !== true;
@@ -92,11 +135,29 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
   const cwd = process.cwd();
   configureAiCache({ enabled: cacheEnabled, cwd });
 
+  const filterCriteria: FlowFilterCriteria = {
+    flowIds: splitCsv(args.flags.flows),
+    features: splitCsv(args.flags.features),
+    tags: splitCsv(args.flags.tags),
+    excludeTags: splitCsv(args.flags["exclude-tags"]),
+    paths: splitCsv(args.flags.paths),
+  };
+  const filterIsActive =
+    (filterCriteria.flowIds?.length ?? 0) > 0 ||
+    (filterCriteria.features?.length ?? 0) > 0 ||
+    (filterCriteria.tags?.length ?? 0) > 0 ||
+    (filterCriteria.excludeTags?.length ?? 0) > 0 ||
+    (filterCriteria.paths?.length ?? 0) > 0;
+
   const ts = new Date().toISOString().replace(/[:.]/g, "-");
   const baseDir = join(cwd, ".gauntlet", "runs", ts);
   await mkdir(baseDir, { recursive: true });
 
   console.log(`gauntlet run -> ${url}`);
+  if (prInfo)
+    console.log(`pr: #${prInfo.prNumber} (${prInfo.branch}) via ${prInfo.source}`);
+  if (surfaceArg) console.log(`surface: ${surfaceArg}`);
+  if (filterIsActive) console.log(`filter: ${describeCriteria(filterCriteria)}`);
   console.log(`personas: ${personaIds.join(", ")}`);
   console.log(`run dir: ${baseDir}`);
   console.log(`concurrency: ${concurrency}`);
@@ -107,13 +168,61 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
     return providerLazy;
   };
 
+  // If --surface was provided and --personas was not, auto-select every
+  // curated persona belonging to that surface.
+  if (surfaceArg && personaIds.length === 0) {
+    const { listCuratedPersonas } = await import("./persona/loader.ts");
+    const allCurated = await listCuratedPersonas(cwd);
+    const matched: string[] = [];
+    for (const id of allCurated) {
+      const p = await loadPersona(id, cwd);
+      if (p.surface === surfaceArg) matched.push(id);
+    }
+    if (matched.length === 0) {
+      console.error(`error: no curated personas have surface="${surfaceArg}".`);
+      process.exit(2);
+    }
+    personaIds = matched;
+  }
+
   // Pre-resolve every persona + its flows, so we can plan concurrency.
   const plans: { persona: Awaited<ReturnType<typeof loadPersona>>; flows: Awaited<ReturnType<typeof loadFlowsForPersona>> }[] = [];
+  let totalDroppedByFilter = 0;
   for (const id of personaIds) {
     if (!id) continue;
     const persona = await loadPersona(id, cwd);
-    const flows = forceLegacy ? [] : await loadFlowsForPersona(id, cwd);
+    if (surfaceArg && persona.surface && persona.surface !== surfaceArg) {
+      console.warn(`warn: persona ${id} has surface="${persona.surface}", skipping under --surface=${surfaceArg}.`);
+      continue;
+    }
+    let flows = forceLegacy ? [] : await loadFlowsForPersona(id, cwd);
+    if (!forceLegacy && filterIsActive && flows.length > 0) {
+      const before = flows.length;
+      const { kept, dropped } = filterFlows(flows, filterCriteria);
+      flows = kept;
+      totalDroppedByFilter += dropped.length;
+      if (kept.length < before) {
+        console.log(
+          `[${id}] filter kept ${kept.length}/${before} flows (${dropped.length} dropped)`,
+        );
+      }
+    }
     plans.push({ persona, flows });
+  }
+  if (filterIsActive) {
+    const totalKept = plans.reduce((n, p) => n + p.flows.length, 0);
+    if (totalKept === 0) {
+      console.error(
+        `error: filter matched zero flows (${describeCriteria(filterCriteria)}).\n` +
+          `hint: run \`gauntlet list\` to see available flow ids; check flow.feature/tags/paths fields.`,
+      );
+      process.exit(2);
+    }
+    console.log(`filter: ${totalKept} flow${totalKept === 1 ? "" : "s"} kept, ${totalDroppedByFilter} dropped across ${plans.length} persona${plans.length === 1 ? "" : "s"}.`);
+  }
+  if (plans.length === 0) {
+    console.error("error: no personas to run.");
+    process.exit(2);
   }
 
   const startedAt = Date.now();
@@ -216,6 +325,20 @@ async function cmdReport(args: ParsedArgs): Promise<void> {
     for (const p of built.report.patterns.slice(0, 5)) {
       console.log(`  ${p.signature.padEnd(50)} ${p.count}x (${p.personas.join(", ")})`);
     }
+  }
+}
+
+async function cmdSurfaces(): Promise<void> {
+  const surfaces = await loadAllSurfaces();
+  if (surfaces.length === 0) {
+    console.log("no surfaces curated yet. run `gauntlet init` to discover them.");
+    return;
+  }
+  console.log("curated surfaces (.gauntlet/surfaces/):");
+  for (const s of surfaces) {
+    console.log(`  ${s.id.padEnd(24)} ${s.name}`);
+    console.log(`  ${" ".repeat(24)}   audience: ${s.audience}`);
+    if (s.base_url) console.log(`  ${" ".repeat(24)}   base_url: ${s.base_url}`);
   }
 }
 
@@ -394,8 +517,13 @@ function cmdHelp(): void {
 usage:
   gauntlet init [--url <url>] [--model <id>] [--count N]
   gauntlet flows [--personas <id[,id...]>] [--model <id>] [--count N] [--url <url>]
-  gauntlet run <url> --personas <id[,id...]> [--steps N] [--headed]
+  gauntlet run [<url> | --url <url> | --surface <id> | --pr <num>]
+               [--personas <id[,id...]>]
+               [--flows <id[,id...]>] [--features <name[,...]>]
+               [--tags <tag[,...]>] [--exclude-tags <tag[,...]>]
+               [--paths <path[,...]>]
   gauntlet report [<run-dir>] [--run <path>] [--no-vet]
+  gauntlet surfaces
   gauntlet list
   gauntlet help
 
@@ -412,16 +540,39 @@ flows flags:
   --url <url>        landing page to include in product context (optional)
   --no-cache         disable AI response cache
 
-run flags:
-  --personas <ids>   comma-separated persona ids
-  --steps <n>        legacy single-step capture step count (default 1)
-  --headed           run browser visibly (default headless)
-  --model <id>       AI model for in-flow actions (default ${DEFAULT_MODEL})
-  --concurrency <n>  personas to run in parallel (default 2)
-  --quiet            suppress per-step heartbeat lines
-  --no-cache         disable AI response cache
-  --no-flows         force legacy single-step capture even if flows exist
-  --no-report        skip post-run report build
+run target (pick one; combinable):
+  <url> | --url <url>   point gauntlet at any URL
+  --surface <id>        use surface.base_url + auto-select surface-tagged personas
+  --pr <num>            resolve preview URL via .gauntlet/config.json
+                        pr_url_template, else scan PR comments for vercel /
+                        netlify / render / cloudflare-pages / fly preview URLs
+
+run who:
+  --personas <ids>      comma-separated persona ids (default: all under surface)
+
+run what (flow filters; combine with AND, --tags is OR within group):
+  --flows <ids>         only these flow ids
+  --features <names>    flows whose flow.feature is in this list
+  --tags <tags>         flows whose flow.tags has ANY of these
+  --exclude-tags <tags> drop flows whose flow.tags has ANY of these
+  --paths <paths>       flows whose flow.paths overlap (supports * glob)
+
+run misc:
+  --steps <n>           legacy single-step capture step count (default 1)
+  --headed              run browser visibly (default headless)
+  --model <id>          AI model for in-flow actions (default ${DEFAULT_MODEL})
+  --concurrency <n>     personas to run in parallel (default 2)
+  --quiet               suppress per-step heartbeat lines
+  --no-cache            disable AI response cache
+  --no-flows            force legacy single-step capture even if flows exist
+  --no-report           skip post-run report build
+
+run examples:
+  gauntlet run --url https://staging.example.com --features checkout
+  gauntlet run --surface marketing --tags smoke
+  gauntlet run --pr 123                          # full surface against PR preview
+  gauntlet run --pr 123 --features checkout      # just the feature you changed
+  gauntlet run --surface app --personas mary --flows mary--save-recipe
 
 report flags:
   --run <path>       path to a run directory (default: latest under .gauntlet/runs/)
@@ -443,6 +594,9 @@ async function main(): Promise<void> {
       break;
     case "report":
       await cmdReport(args);
+      break;
+    case "surfaces":
+      await cmdSurfaces();
       break;
     case "list":
       await cmdList();

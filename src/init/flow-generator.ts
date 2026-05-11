@@ -3,6 +3,7 @@ import type { AiProvider } from "../ai/provider.ts";
 import type { Persona } from "../persona/schema.ts";
 import { FlowSchema, type Flow } from "../flow/schema.ts";
 import { type ProjectContext, summarizeProject } from "./project-reader.ts";
+import type { Surface } from "../surface/schema.ts";
 
 const FlowSetSchema = z.object({
   flows: z.array(FlowSchema).min(1).max(6),
@@ -24,7 +25,10 @@ const SCHEMA_EXAMPLE = `{
           "give_up_criteria": ["condition 1", "condition 2"]
         }
       ],
-      "rationale": "One sentence: why this flow stress-tests something useful."
+      "rationale": "One sentence: why this flow stress-tests something useful.",
+      "feature": "checkout" | null,
+      "tags": ["smoke", "critical"],
+      "paths": ["/checkout/*", "/cart"]
     }
   ]
 }`;
@@ -46,6 +50,9 @@ Rules:
 - 3-8 steps per flow; favor short focused flows over long ones
 - Flow content must reflect the persona's character, voice, and constraints. A keyboard-only persona never says "click"; they say "tab to" or "activate". A low-reading-level persona scans for verbs, not labels.
 - Mix flow types where it makes sense: at least one happy-path flow, at least one stress-test flow (the persona tries something this product probably mishandles).
+- Set "feature" to exactly one capability the flow exercises. When the surface section lists features, pick from that list. When unsure, omit the field rather than guess.
+- "tags" is free-form. Always tag the obvious happy-path as ["smoke"] and the stress-test as ["edge"]. Add "critical" only if a failure here blocks the persona's core goal.
+- "paths" is optional URL path patterns the flow plausibly visits. Use globs ("/checkout/*"). Omit if you cannot infer them from the product context.
 - Output ONLY a JSON object exactly matching the schema below. No prose, no markdown fences.
 
 Example shape:
@@ -55,6 +62,7 @@ export interface GenerateFlowsOptions {
   provider: AiProvider;
   project: ProjectContext;
   persona: Persona;
+  surface?: Surface;
   count?: number;
 }
 
@@ -85,11 +93,26 @@ function personaToPrompt(persona: Persona): string {
 }
 
 export async function generateFlows(opts: GenerateFlowsOptions): Promise<Flow[]> {
+  const surfaceBlock = opts.surface
+    ? `## Surface this persona lives on
+id: ${opts.surface.id}
+name: ${opts.surface.name}
+base_url: ${opts.surface.base_url ?? "(unset)"}
+audience: ${opts.surface.audience}
+features available: ${opts.surface.features.join(", ") || "(none listed)"}
+NOT available on this surface: ${opts.surface.excluded_features.join(", ") || "(none listed)"}
+
+DO NOT propose flows that reference features in "NOT available". The persona cannot find what isn't there.`
+    : "";
+
   const userPrompt = [
     `## Product context\n${summarizeProject(opts.project)}`,
+    surfaceBlock,
     `## Persona\n${personaToPrompt(opts.persona)}`,
-    `## Task\nPropose ${opts.count ?? 3} flows this persona would attempt on this product.`,
-  ].join("\n\n");
+    `## Task\nPropose ${opts.count ?? 3} flows this persona would attempt on this surface.`,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
 
   const result = await opts.provider.propose({
     messages: [
