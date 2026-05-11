@@ -49,22 +49,37 @@ export async function judgeStep(ctx: JudgeContext): Promise<StepVerdict> {
       : "  (none specified)";
 
   const voicePreamble = ctx.personaVoice
-    ? `\nPersona voice: ${ctx.personaVoice.trim()}\nJudge as this persona would — they decide what counts as success or abandon.`
+    ? `\nPersona voice (for tone of evidence text only — does NOT entitle the persona to bail for aesthetic reasons): ${ctx.personaVoice.trim()}`
     : "";
+
+  // The judge prompt is deliberately strict about what counts as give_up.
+  // Without these rules the AI dramatises the persona's personality and
+  // bails the moment a page looks "cluttered" or "corporate" rather than
+  // actually trying to complete the step. Bias toward in_progress.
+  const SYSTEM = `You judge whether the current step of a real user-test flow succeeded, is still in progress, or has hit a give-up condition. Output ONLY JSON matching {"status":"success"|"in_progress"|"give_up","give_up_reason":string?,"evidence":string}.
+
+STRICT RULES:
+1. Default to "in_progress" when uncertain. The flow has more steps; this judge runs once per step, not at the end.
+2. "success" requires concrete evidence the success_criteria is met (URL match, expected text/heading visible in the outline, confirmation message present, expected element index in outline, etc). Cite the evidence verbatim.
+3. "give_up" is for objective blockers ONLY. Allowed reasons:
+     a. The previous action FAILED ('action: failed' in the last-action note) AND no obvious recovery is on the page.
+     b. A specific give_up_criterion has DEMONSTRABLY fired with observable evidence (cite which one + what you saw).
+     c. The expected element / functionality is not present on the page AND the persona has no way to navigate to it.
+4. Do NOT give up because the page looks busy, the copy is corporate, the brand is mid, or the persona "would feel impatient". The persona's voice/personality is for narration tone, not a license to abandon. Stress is fine; abandonment requires a concrete blocker.
+5. If 'last action: performed' (success), and the outline now shows progress toward success_criteria, prefer "in_progress" over "give_up".
+
+Evidence must reference observable state: an outline index, a literal URL, a literal page title, a literal heading text, or the last-action result. Do not write evidence like "this looks frustrating" — that is not evidence.${voicePreamble}`;
 
   return ctx.provider.propose({
     messages: [
-      {
-        role: "system",
-        content: `You are the in-character persona deciding whether the current step of a test flow has succeeded, is still in progress, or has hit a give-up condition. Output ONLY JSON matching {"status":"success"|"in_progress"|"give_up","give_up_reason":string?,"evidence":string}.${voicePreamble}`,
-      },
+      { role: "system", content: SYSTEM },
       {
         role: "user",
         content: `Step ${ctx.stepIndex + 1}/${ctx.totalSteps} of the flow.
 
 Intent: ${ctx.step.intent}
 ${ctx.step.observation_target ? `Looking for: ${ctx.step.observation_target}\n` : ""}Success criteria: ${ctx.step.success_criteria}
-Give-up criteria:
+Give-up criteria (only fire one of these — and only with observable evidence):
 ${giveUpList}
 
 Current page:
@@ -76,7 +91,7 @@ ${lastAction}
 Visible outline:
 ${summarizeOutline(outline, 60)}
 
-Verdict?`,
+Verdict? Remember: bias toward in_progress; give_up requires an observable blocker, not aesthetic distaste.`,
       },
     ],
     schema: StepVerdictSchema,

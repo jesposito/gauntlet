@@ -6,7 +6,40 @@ The format roughly follows [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ## Unreleased
 
+### Changed
+
+- **Step-judge now requires observable evidence for `give_up`.** Previous
+  prompt let the AI bail for aesthetic reasons because the persona's
+  voice / personality was framed as "judge as the persona would". Now
+  the prompt is explicit: default to `in_progress`; `give_up` is only
+  for objective blockers (last action FAILED with no recovery, expected
+  element absent with no nav to it, or a specific give_up_criterion
+  observably fired). Persona voice is for narration tone only, not a
+  license to abandon. Cuts the dramatized-abandon noise that surfaced
+  during Facet Cloud dogfood.
+- **Flow generator instructs give_up_criteria to be OBSERVABLE blockers**
+  ("submit button disabled with no error explanation"), not personality
+  grumbles ("the page feels cluttered"). The judge ignores subjective
+  criteria so the flow would otherwise just run in_progress forever.
+- **`aiOpWithTimeout` retries once on `StepTimeoutError`.** Anthropic /
+  OpenAI / Google 5xx + transient slowness is common; one fresh-signal
+  retry catches it without hiding real hangs (the second timeout still
+  bails cleanly).
+- **Per-flow wallclock budget.** Hard cap at 5 minutes per flow,
+  independent of per-step timeouts. A flow whose every step succeeds
+  within 60s can't accumulate beyond the budget. Outcome is `timeout`.
+- **Playwright default timeouts scale with persona network profile.**
+  slow-3g now gets up to 90s selector / navigation defaults instead of
+  the unscaled 30s, removing the "selector not found on slow network"
+  false-negative class.
+
 ### Added
+
+- **`docs/PRIOR-ART.md`** — survey of how Stagehand, browser-use,
+  Skyvern, LaVague, Anthropic Computer Use, WebVoyager handle the same
+  reliability problems Gauntlet has. Patterns A-I + ranked roadmap of
+  the 7 next moves. Ground truth for "which research idea is worth
+  borrowing next."
 
 - **`gauntlet comment <run-dir> --pr <num>`**. Reads a built `report.json`
   and posts a compact, prioritized PR comment via `gh pr comment`: top

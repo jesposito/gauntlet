@@ -21,6 +21,13 @@ import { judgeStep, type StepVerdict } from "./step-judge.ts";
 
 const STEP_OP_TIMEOUT_MS = 60_000;
 
+/**
+ * Hard wallclock cap per flow. Even if every step succeeds within the per-step
+ * timeout, the cumulative budget is bounded so a runaway flow can't hold up
+ * the concurrent pool indefinitely. Tuned to ~10x a typical persona patience.
+ */
+const FLOW_WALLCLOCK_BUDGET_MS = 5 * 60_000;
+
 class StepTimeoutError extends Error {
   constructor(label: string, ms: number) {
     super(`${label} timed out after ${ms}ms`);
@@ -60,6 +67,29 @@ function withCancellableTimeout<T>(
   return Promise.race([build(controller.signal), timeout]).finally(() => {
     if (timer) clearTimeout(timer);
   }) as Promise<T>;
+}
+
+/**
+ * Cancellable timeout with one retry. AI providers occasionally rate-limit
+ * or return slow over flaky transit; a single retry catches transient
+ * issues without hiding real hangs (still bounded by the same per-attempt
+ * timeout). The persistent failure still throws StepTimeoutError on the
+ * second attempt, so the outer catch can bail cleanly.
+ */
+async function aiOpWithTimeout<T>(
+  build: (signal: AbortSignal) => Promise<T>,
+  ms: number,
+  label: string,
+): Promise<T> {
+  try {
+    return await withCancellableTimeout(build, ms, label);
+  } catch (err) {
+    if (err instanceof StepTimeoutError) {
+      // One retry. Fresh signal, fresh budget.
+      return await withCancellableTimeout(build, ms, `${label} (retry)`);
+    }
+    throw err;
+  }
 }
 
 const DEVICE_USER_AGENTS: Record<string, string> = {
@@ -174,6 +204,13 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
   }
 
   const page = await context.newPage();
+  // Scale Playwright's default action/navigation timeouts with the persona's
+  // network profile so a slow-3g persona doesn't fail every selector lookup
+  // at the 30s default. Floor 30s, cap 90s.
+  const networkSlowdown = Math.max(1, Math.round((netProfile.latencyMs || 0) / 100));
+  const scaledDefaultTimeout = Math.min(90_000, Math.max(30_000, 30_000 * networkSlowdown));
+  page.setDefaultTimeout(scaledDefaultTimeout);
+  page.setDefaultNavigationTimeout(scaledDefaultTimeout);
   const cdp = await context.newCDPSession(page);
   await cdp.send("Network.emulateNetworkConditions", {
     offline: netProfile.offline,
@@ -283,6 +320,23 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
       const step = flow.steps[i]!;
       emit({ type: "step_start", personaId: persona.id, flowId: flow.id, stepIndex: i, intent: step.intent });
       const elapsedS = (Date.now() - startedAt) / 1000;
+      // Hard wallclock cap independent of persona patience: even if each
+      // step succeeds within its timeout, the flow can't run longer than
+      // FLOW_WALLCLOCK_BUDGET_MS total. Protects the concurrent pool slot.
+      const elapsedMs = Date.now() - startedAt;
+      if (elapsedMs > FLOW_WALLCLOCK_BUDGET_MS) {
+        outcome = "timeout";
+        outcomeReason = `flow wallclock budget (${FLOW_WALLCLOCK_BUDGET_MS / 1000}s) exceeded after ${(elapsedMs / 1000).toFixed(1)}s`;
+        failures.push({
+          reason: FailureReason.NAVIGATION_TIMEOUT,
+          message: outcomeReason,
+          timestamp: Date.now(),
+          stepIndex: i,
+          url: page.url(),
+        });
+        emit({ type: "step_verdict", personaId: persona.id, flowId: flow.id, stepIndex: i, status: "give_up", evidence: outcomeReason });
+        break;
+      }
       if (elapsedS > persona.behavior.patience_threshold_seconds) {
         outcome = "patience_exceeded";
         outcomeReason = `persona patience (${persona.behavior.patience_threshold_seconds}s) exceeded after ${elapsedS.toFixed(1)}s`;
@@ -304,7 +358,7 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
 
       try {
       if (step.observation_target) {
-        const obs = await withCancellableTimeout(
+        const obs = await aiOpWithTimeout(
           (signal) => observe({ ...actionCtx, signal }, step.observation_target!),
           STEP_OP_TIMEOUT_MS,
           "observe",
@@ -344,7 +398,7 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
         }
       }
 
-      const actionResult = await withCancellableTimeout(
+      const actionResult = await aiOpWithTimeout(
         (signal) => act({ ...actionCtx, signal }, step.intent),
         STEP_OP_TIMEOUT_MS,
         "act",
@@ -407,7 +461,7 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
         });
       }
 
-      const verdict = await withCancellableTimeout(
+      const verdict = await aiOpWithTimeout(
         (signal) =>
           judgeStep({
             provider,

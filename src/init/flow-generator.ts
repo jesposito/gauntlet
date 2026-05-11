@@ -43,7 +43,7 @@ For this persona, propose 2-4 flows they would realistically attempt on this pro
 - intent: what the persona is trying to do, in their own words, one sentence
 - observation_target: what they're looking for on the page before acting (used by the runner's observe() primitive)
 - success_criteria: an observable signal that the step succeeded
-- give_up_criteria: 1-3 specific abandon conditions consistent with this persona's avoids/abandons_on
+- give_up_criteria: 1-3 OBSERVABLE blocker conditions, not personality grumbles. Good: "form does not accept email without phone number", "no Sign-out link visible after 3 nav levels", "submit button is disabled and no error explains why". Bad: "the page feels cluttered", "the brand voice is corporate", "I am impatient". The step judge requires concrete evidence for give_up — purely subjective criteria are ignored and the persona gets stuck running in_progress until the flow runs out of steps.
 
 Rules:
 - ids: kebab-case, prefixed "<persona-id>--<flow-id>" (e.g. "mary--save-chicken-recipe")
