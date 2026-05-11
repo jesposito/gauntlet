@@ -1,6 +1,6 @@
 {
   "name": "gauntlet",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "Run a gauntlet of personas against your product. Get repro-ready UX + a11y bugs in 10 minutes.",
   "type": "module",
   "bin": {

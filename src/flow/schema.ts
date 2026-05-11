@@ -36,7 +36,9 @@ export const FlowSchema = z.object({
     ),
   starting_url_hint: z
     .string()
+    .nullable()
     .optional()
+    .transform((v) => v ?? undefined)
     .describe(
       "Optional hint at where the flow starts (e.g. '/pricing', 'the homepage'). Resolved against the run URL.",
     ),

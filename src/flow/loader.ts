@@ -34,8 +34,13 @@ export async function loadFlowsForPersona(
   const ids = await listFlows(cwd);
   const flows: Flow[] = [];
   for (const id of ids) {
-    if (!id.startsWith(`${personaId}--`)) continue;
-    flows.push(await loadFlow(id, cwd));
+    let flow: Flow;
+    try {
+      flow = await loadFlow(id, cwd);
+    } catch {
+      continue;
+    }
+    if (flow.persona_id === personaId) flows.push(flow);
   }
   return flows;
 }

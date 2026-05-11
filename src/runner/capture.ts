@@ -53,7 +53,28 @@ export async function captureStep(
   const consoleLogPath = join(stepDir, "console.jsonl");
   const networkLogPath = join(stepDir, "network.jsonl");
 
-  await page.screenshot({ path: screenshotPath, fullPage: false });
+  // SPAs with streaming content can keep painting forever; bound the
+  // screenshot wait and fall back to a still-frame on timeout.
+  try {
+    await page.screenshot({ path: screenshotPath, fullPage: false, timeout: 10_000 });
+  } catch (err) {
+    try {
+      await page.screenshot({
+        path: screenshotPath,
+        fullPage: false,
+        timeout: 4_000,
+        animations: "disabled",
+        caret: "hide",
+      });
+    } catch {
+      // give up on this step's screenshot rather than fail the whole run
+      await writeFile(
+        screenshotPath.replace(/\.png$/, ".error.txt"),
+        `screenshot failed: ${err instanceof Error ? err.message : String(err)}`,
+        "utf8",
+      );
+    }
+  }
 
   const html = await page.content();
   await writeFile(domPath, html, "utf8");

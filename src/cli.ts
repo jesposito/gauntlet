@@ -420,7 +420,14 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err) => {
-  console.error("fatal:", err);
-  process.exit(1);
-});
+main()
+  .then(() => {
+    // Force exit: keep-alive HTTP sockets (Anthropic/OpenAI) and any lingering
+    // Playwright handles can hold the event loop open even after all our work
+    // is done. We've already awaited everything we care about.
+    process.exit(0);
+  })
+  .catch((err) => {
+    console.error("fatal:", err);
+    process.exit(1);
+  });

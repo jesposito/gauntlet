@@ -14,8 +14,8 @@ Self-hosted. MIT. BYO AI key.
 | 2 | `gauntlet init`: project reader (Phase A) + AI persona curation (Phase B) against 8 behavior templates | shipped |
 | 2.5 | axe-core scan at every captured step; persona `abandons_on` rules mapped to axe rule ids | shipped |
 | 3 | Phase C: flow proposal per persona, curated | pending |
-| 4 | Phase D: isolated browser execution per persona with an action loop (`act`/`observe`/`extract`) | pending |
-| 5 | Phase E + F: per-persona reports, cross-persona rollup, vetting layer that re-runs the replay before publishing | pending |
+| 4 | Phase D: isolated browser execution per persona with an action loop (`act` / `observe` / `extract`) on top of Playwright | shipped |
+| 5 | Phase E + F: per-persona reports, cross-persona rollup, vetting layer that re-runs the replay before publishing | shipped |
 
 Tracked in beads — `bd show gauntlet-tn8` for the polish epic, `bd ready` for what's next.
 
@@ -29,12 +29,20 @@ bunx playwright install chromium
 ## Usage
 
 ```bash
-# Phase A + B: generate a persona roster for the project in cwd.
 export ANTHROPIC_API_KEY=sk-ant-...
+
+# Phase A + B: generate a persona roster for the project in cwd.
 bun run src/cli.ts init --url https://localhost:3000
 
-# Today's run command (single step; no action loop yet).
-bun run src/cli.ts run https://localhost:3000 --personas mary
+# Phase C: per-persona test flows.
+bun run src/cli.ts flows --personas mary,marcus
+
+# Phase D + E + F: execute flows, capture every step, judge per step,
+# auto-build REPORT.md with the vetting layer re-running replays.
+bun run src/cli.ts run https://localhost:3000 --personas mary,marcus
+
+# Or rebuild a report against an existing run.
+bun run src/cli.ts report
 ```
 
 `gauntlet init` reads `README.md`, `package.json`, optionally fetches the URL, and asks the configured model to propose 8–12 persona candidates (mix of core and edge). It walks each one interactively:
@@ -62,8 +70,11 @@ Actions: accept, reject, edit in `$EDITOR`, regenerate this slot, write-my-own, 
 ### Flags
 
 ```
-gauntlet init [--url <url>] [--model <id>] [--count N] [--no-cache]
-gauntlet run <url> --personas <id[,id...]> [--steps N] [--headed]
+gauntlet init   [--url <url>] [--model <id>] [--count N] [--no-cache]
+gauntlet flows  [--personas <id[,id...]>] [--model <id>] [--count N] [--url <url>] [--no-cache]
+gauntlet run    <url> --personas <id[,id...]> [--model <id>]
+                [--headed] [--no-cache] [--no-flows] [--no-report]
+gauntlet report [<run-dir>] [--run <path>] [--no-vet]
 gauntlet list
 ```
 
@@ -91,6 +102,19 @@ axe-core runs on every captured step (output: `steps/NNNN/axe.json`).
 - Serious and critical axe violations become `FailureReason.ACCESSIBILITY_VIOLATION` events.
 - Persona `abandons_on` / `avoids` entries map to axe rule ids via `PERSONA_RULE_TO_AXE_ID` (e.g. `form_field_missing_label` → axe `label`, `unlabeled_icon_buttons` → axe `button-name`). When axe sees the rule and the persona was watching for it, the failure is reported as `ABANDONED_BY_PERSONA` with the axe rule id attached.
 
+## Vetting layer
+
+After a run, every finding is replayed before it lands in `REPORT.md`:
+
+- **axe** findings: re-navigate to the captured URL, re-run axe, assert the same rule id is still in the violations. Pass → `[VERIFIED]`. No longer present → `[regressed]` (likely stale or flaky).
+- **HTTP 5xx / console errors**: re-navigate to the URL and check whether the same noisy condition fires. Pass → `[VERIFIED]`.
+- **Persona-judge** findings (`ABANDONED_BY_PERSONA` via the AI step verdict): flagged `[subjective]` for human triage. Full flow-replay vetting is on the roadmap.
+- **Navigation timeouts** and other transient failures: flagged `[subjective]`.
+
+The vetter groups findings by URL and shares one browser across the batch, so a run with N findings at K distinct URLs costs K navigations, not N.
+
+Output: `REPORT.md` (severity-sorted markdown with badges + artifact paths) and `report.json` (machine-readable) at the run directory.
+
 ## AI providers
 
 | Provider | Model prefix | Env var |
@@ -106,7 +130,7 @@ Default model: `claude-opus-4-7`. Responses are cached on disk at `.gauntlet/cac
 
 ```
 src/
-  cli.ts                       # init | run | list | help
+  cli.ts                       # init | flows | run | report | list | help
   ai/
     provider.ts                # interface + registry + caching decorator
     cache.ts                   # sha256-keyed disk cache
@@ -114,32 +138,54 @@ src/
   init/
     project-reader.ts          # Phase A
     persona-generator.ts       # Phase B AI call
-    curate.ts                  # interactive a/r/e/g/w/q loop
+    flow-generator.ts          # Phase C AI call (per persona)
+    curate.ts                  # persona curation loop
+    curate-flows.ts            # flow curation loop
   persona/
     schema.ts                  # zod Persona / Character / Behavior / OCEAN
     templates/*.yaml           # 8 behavior skeletons
     templates.ts               # template loader
     loader.ts                  # curated -> built-in -> path resolution
     library/mary.yaml          # worked example
+  flow/
+    schema.ts                  # zod Flow / FlowStep
+    loader.ts                  # read/write/list flows under .gauntlet/flows/
+  agent/
+    dom-outline.ts             # numbered outline of visible interactive elements
+    actions.ts                 # act / observe / extract primitives
   runner/
-    browser.ts                 # Playwright launch + persona context
+    browser.ts                 # legacy single-step capture
+    flow-runner.ts             # Phase D: observe -> act -> capture -> judge
+    step-judge.ts              # AI step verdict
     capture.ts                 # per-step forensic snapshot
     axe-scan.ts                # axe-core + persona-rule mapping
     network-profiles.ts        # fast-fiber, home-wifi, slow-3g, ...
     failure-reasons.ts         # FailureEvent enum
+  report/
+    schema.ts                  # zod Finding / PersonaReport / RunReport
+    generator.ts               # flow-result.json -> Findings (with dedup)
+    rollup.ts                  # cross-persona patterns
+    vetter.ts                  # replay verification (URL-grouped)
+    render-markdown.ts         # REPORT.md
+    build.ts                   # top-level orchestrator
 
 .gauntlet/
   personas/                    # curated roster
+  flows/                       # curated flows per persona
   cache/ai/                    # AI response cache (gitignored)
-  runs/<ts>/<persona>/         # artifacts per run
-    video/, meta.json
-    steps/0000/
-      screenshot.png
-      dom.html
-      ax-tree.json
-      axe.json
-      console.jsonl
-      network.jsonl
+  runs/<ts>/                   # artifacts per run
+    REPORT.md                  # vetted, severity-sorted markdown
+    report.json                # machine-readable
+    <persona>/<flow>/
+      flow-result.json
+      video/
+      steps/0000/
+        screenshot.png
+        dom.html
+        ax-tree.json
+        axe.json
+        console.jsonl
+        network.jsonl
 ```
 
 ## Related tools
