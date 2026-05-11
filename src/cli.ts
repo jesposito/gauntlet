@@ -7,7 +7,8 @@ import {
   listCuratedPersonas,
 } from "./persona/loader.ts";
 import { runPersona } from "./runner/browser.ts";
-import { runFlow } from "./runner/flow-runner.ts";
+import { runFlow, type FlowEvent } from "./runner/flow-runner.ts";
+import { runWithConcurrency } from "./util/pool.ts";
 import { buildReport, findLatestRunDir } from "./report/build.ts";
 import { DEFAULT_MODEL, pickProvider } from "./ai/index.ts";
 import { configureAiCache } from "./ai/cache.ts";
@@ -82,6 +83,11 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
   const model =
     typeof args.flags.model === "string" ? args.flags.model : DEFAULT_MODEL;
   const forceLegacy = args.flags["no-flows"] === true;
+  const concurrency = Math.max(
+    1,
+    args.flags.concurrency ? Number(args.flags.concurrency) : 2,
+  );
+  const quiet = args.flags.quiet === true;
 
   const cwd = process.cwd();
   configureAiCache({ enabled: cacheEnabled, cwd });
@@ -93,6 +99,7 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
   console.log(`gauntlet run -> ${url}`);
   console.log(`personas: ${personaIds.join(", ")}`);
   console.log(`run dir: ${baseDir}`);
+  console.log(`concurrency: ${concurrency}`);
 
   let providerLazy: ReturnType<typeof pickProvider> | undefined;
   const getProvider = (): ReturnType<typeof pickProvider> => {
@@ -100,29 +107,67 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
     return providerLazy;
   };
 
+  // Pre-resolve every persona + its flows, so we can plan concurrency.
+  const plans: { persona: Awaited<ReturnType<typeof loadPersona>>; flows: Awaited<ReturnType<typeof loadFlowsForPersona>> }[] = [];
   for (const id of personaIds) {
     if (!id) continue;
     const persona = await loadPersona(id, cwd);
     const flows = forceLegacy ? [] : await loadFlowsForPersona(id, cwd);
+    plans.push({ persona, flows });
+  }
 
+  const startedAt = Date.now();
+  const logEvent = (e: FlowEvent): void => {
+    if (quiet) return;
+    const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1).padStart(5);
+    const prefix = `[+${elapsed}s ${e.personaId}/${e.flowId}]`;
+    switch (e.type) {
+      case "flow_start":
+        console.log(`${prefix} START (${e.totalSteps} steps)`);
+        break;
+      case "step_start":
+        console.log(`${prefix} step ${e.stepIndex + 1}: ${e.intent.slice(0, 100)}`);
+        break;
+      case "step_observe":
+        console.log(`${prefix}   observe -> ${e.matched ? "MATCH" : "NO MATCH"}: ${e.reasoning.slice(0, 100)}`);
+        break;
+      case "step_act":
+        console.log(
+          `${prefix}   act -> ${e.performed ? "OK" : "FAILED"} ${e.action ?? "(none)"}${e.targetName ? ` "${e.targetName.slice(0, 40)}"` : ""}${e.error ? ` err=${e.error.slice(0, 60)}` : ""}`,
+        );
+        break;
+      case "step_verdict":
+        console.log(`${prefix}   verdict=${e.status}: ${e.evidence.slice(0, 100)}`);
+        break;
+      case "flow_end":
+        console.log(`${prefix} END outcome=${e.outcome} duration=${e.durationMs}ms`);
+        break;
+    }
+  };
+
+  type PersonaResult = { persona: string; flows: number; failures: number; outcomes: string[] };
+
+  await runWithConcurrency<typeof plans[number], PersonaResult>(plans, concurrency, async (plan) => {
+    const { persona, flows } = plan;
     if (flows.length === 0) {
       const runDir = join(baseDir, persona.id);
       console.log(
-        `\n[${persona.id}] ${persona.character.name} -> ${url} (no flows; legacy single-step capture)`,
+        `[${persona.id}] ${persona.character.name} -> ${url} (no flows; legacy single-step capture)`,
       );
       const result = await runPersona({ url, persona, runDir, maxSteps, headless });
       console.log(
         `[${persona.id}] done. steps=${result.steps} failures=${result.failures.length} duration=${result.durationMs}ms`,
       );
-      continue;
+      return { persona: persona.id, flows: 0, failures: result.failures.length, outcomes: [] };
     }
 
     console.log(
-      `\n[${persona.id}] ${persona.character.name} -> ${url} (${flows.length} flow${flows.length === 1 ? "" : "s"})`,
+      `[${persona.id}] ${persona.character.name} -> ${url} (${flows.length} flow${flows.length === 1 ? "" : "s"})`,
     );
+    let totalFailures = 0;
+    const outcomes: string[] = [];
     for (const flow of flows) {
       const runDir = join(baseDir, persona.id, flow.id);
-      console.log(`  flow: ${flow.id} (${flow.steps.length} steps) - ${flow.title}`);
       const result = await runFlow({
         url,
         persona,
@@ -130,21 +175,13 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
         provider: getProvider(),
         runDir,
         headless,
+        onEvent: logEvent,
       });
-      const stepSummary = result.steps
-        .map((s) => `${s.stepIndex + 1}:${s.verdict.status[0]}`)
-        .join(" ");
-      console.log(
-        `    outcome=${result.outcome} steps=[${stepSummary}] failures=${result.failures.length} duration=${result.durationMs}ms`,
-      );
-      if (result.outcomeReason) console.log(`    why: ${result.outcomeReason}`);
-      if (result.failures.length > 0) {
-        for (const f of result.failures.slice(0, 3)) {
-          console.log(`      - ${f.reason}: ${f.message.slice(0, 140)}`);
-        }
-      }
+      totalFailures += result.failures.length;
+      outcomes.push(result.outcome);
     }
-  }
+    return { persona: persona.id, flows: flows.length, failures: totalFailures, outcomes };
+  });
 
   console.log(`\nartifacts: ${baseDir}`);
 
@@ -380,6 +417,8 @@ run flags:
   --steps <n>        legacy single-step capture step count (default 1)
   --headed           run browser visibly (default headless)
   --model <id>       AI model for in-flow actions (default ${DEFAULT_MODEL})
+  --concurrency <n>  personas to run in parallel (default 2)
+  --quiet            suppress per-step heartbeat lines
   --no-cache         disable AI response cache
   --no-flows         force legacy single-step capture even if flows exist
   --no-report        skip post-run report build

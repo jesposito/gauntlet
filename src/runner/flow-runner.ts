@@ -29,6 +29,16 @@ const DEVICE_USER_AGENTS: Record<string, string> = {
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
 };
 
+export type FlowEvent =
+  | { type: "flow_start"; personaId: string; flowId: string; totalSteps: number }
+  | { type: "step_start"; personaId: string; flowId: string; stepIndex: number; intent: string }
+  | { type: "step_observe"; personaId: string; flowId: string; stepIndex: number; matched: boolean; reasoning: string }
+  | { type: "step_act"; personaId: string; flowId: string; stepIndex: number; action: string | undefined; targetName: string | undefined; performed: boolean; error?: string }
+  | { type: "step_verdict"; personaId: string; flowId: string; stepIndex: number; status: "success" | "in_progress" | "give_up"; evidence: string }
+  | { type: "flow_end"; personaId: string; flowId: string; outcome: FlowRunResult["outcome"]; durationMs: number };
+
+export type FlowEventHandler = (event: FlowEvent) => void;
+
 export interface FlowRunOptions {
   url: string;
   persona: Persona;
@@ -36,6 +46,7 @@ export interface FlowRunOptions {
   provider: AiProvider;
   runDir: string;
   headless?: boolean;
+  onEvent?: FlowEventHandler;
 }
 
 export interface StepResult {
@@ -75,11 +86,13 @@ function resolveStartUrl(baseUrl: string, hint: string | undefined): string {
 export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
   const { url, persona, flow, provider, runDir } = opts;
   const headless = opts.headless ?? true;
+  const emit: FlowEventHandler = opts.onEvent ?? (() => undefined);
 
   await ensureRunDir(runDir);
   const startedAt = Date.now();
   const failures: FailureEvent[] = [];
   const stepResults: StepResult[] = [];
+  emit({ type: "flow_start", personaId: persona.id, flowId: flow.id, totalSteps: flow.steps.length });
 
   const browser: Browser = await chromium.launch({ headless });
   const ua = DEVICE_USER_AGENTS[persona.behavior.device] ?? DEVICE_USER_AGENTS.desktop!;
@@ -204,6 +217,7 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
   if (outcome === "completed") {
     for (let i = 0; i < flow.steps.length; i++) {
       const step = flow.steps[i]!;
+      emit({ type: "step_start", personaId: persona.id, flowId: flow.id, stepIndex: i, intent: step.intent });
       const elapsedS = (Date.now() - startedAt) / 1000;
       if (elapsedS > persona.behavior.patience_threshold_seconds) {
         outcome = "patience_exceeded";
@@ -226,6 +240,7 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
 
       if (step.observation_target) {
         const obs = await observe(actionCtx, step.observation_target);
+        emit({ type: "step_observe", personaId: persona.id, flowId: flow.id, stepIndex: i, matched: !!obs.match, reasoning: obs.reasoning });
         if (!obs.match) {
           const verdict: StepVerdict = {
             status: "give_up",
@@ -241,6 +256,7 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
             verdict,
             capture,
           });
+          emit({ type: "step_verdict", personaId: persona.id, flowId: flow.id, stepIndex: i, status: "give_up", evidence: verdict.evidence });
           failures.push({
             reason: FailureReason.ABANDONED_BY_PERSONA,
             message: `step ${i + 1}: ${verdict.give_up_reason}`,
@@ -256,6 +272,16 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
       }
 
       const actionResult = await act(actionCtx, step.intent);
+      emit({
+        type: "step_act",
+        personaId: persona.id,
+        flowId: flow.id,
+        stepIndex: i,
+        action: actionResult.action,
+        targetName: actionResult.target?.name,
+        performed: actionResult.performed,
+        ...(actionResult.error !== undefined ? { error: actionResult.error } : {}),
+      });
       try {
         await page.waitForLoadState("networkidle", { timeout: 5000 });
       } catch {
@@ -322,6 +348,14 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
         verdict,
         capture,
       });
+      emit({
+        type: "step_verdict",
+        personaId: persona.id,
+        flowId: flow.id,
+        stepIndex: i,
+        status: verdict.status,
+        evidence: verdict.evidence,
+      });
 
       if (verdict.status === "give_up") {
         failures.push({
@@ -369,6 +403,9 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
   await context.close();
   await browser.close();
 
+  const durationMs = Date.now() - startedAt;
+  emit({ type: "flow_end", personaId: persona.id, flowId: flow.id, outcome, durationMs });
+
   return {
     persona,
     flow,
@@ -378,6 +415,6 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
     failures,
     outcome,
     outcomeReason,
-    durationMs: Date.now() - startedAt,
+    durationMs,
   };
 }
