@@ -1,6 +1,7 @@
 import type { CDPSession, Page } from "playwright";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { runAxe, type AxeScanResult } from "./axe-scan.ts";
 
 export interface StepCapture {
   stepIndex: number;
@@ -10,8 +11,10 @@ export interface StepCapture {
   screenshotPath: string;
   domPath: string;
   axTreePath: string;
+  axeReportPath: string;
   consoleLogPath: string;
   networkLogPath: string;
+  axe: AxeScanResult;
 }
 
 export interface CaptureContext {
@@ -46,6 +49,7 @@ export async function captureStep(
   const screenshotPath = join(stepDir, "screenshot.png");
   const domPath = join(stepDir, "dom.html");
   const axTreePath = join(stepDir, "ax-tree.json");
+  const axeReportPath = join(stepDir, "axe.json");
   const consoleLogPath = join(stepDir, "console.jsonl");
   const networkLogPath = join(stepDir, "network.jsonl");
 
@@ -63,6 +67,9 @@ export async function captureStep(
   }
   await writeFile(axTreePath, JSON.stringify(axTree, null, 2), "utf8");
 
+  const axe = await runAxe(page);
+  await writeFile(axeReportPath, JSON.stringify(axe, null, 2), "utf8");
+
   await writeFile(consoleLogPath, ctx.consoleLog.join("\n"), "utf8");
   await writeFile(
     networkLogPath,
@@ -78,7 +85,9 @@ export async function captureStep(
     screenshotPath,
     domPath,
     axTreePath,
+    axeReportPath,
     consoleLogPath,
     networkLogPath,
+    axe,
   };
 }

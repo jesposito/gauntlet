@@ -18,6 +18,7 @@ import {
   ensureRunDir,
 } from "./capture.ts";
 import { FailureReason, type FailureEvent } from "./failure-reasons.ts";
+import { matchAxeViolationsToPersonaRules } from "./axe-scan.ts";
 
 const DEVICE_USER_AGENTS: Record<string, string> = {
   desktop:
@@ -173,8 +174,46 @@ export async function runPersona(opts: RunOptions): Promise<RunResult> {
     });
   }
 
+  const personaRules = [
+    ...persona.behavior.abandons_on,
+    ...persona.behavior.avoids,
+  ];
   for (let i = 0; i < maxSteps; i++) {
-    await captureStep(page, cdp, captureCtx, i);
+    const cap = await captureStep(page, cdp, captureCtx, i);
+    for (const v of cap.axe.violations) {
+      if (v.impact === "serious" || v.impact === "critical") {
+        failures.push({
+          reason: FailureReason.ACCESSIBILITY_VIOLATION,
+          message: `axe[${v.impact}] ${v.id}: ${v.help} (${v.nodeCount} node${v.nodeCount === 1 ? "" : "s"})`,
+          timestamp: Date.now(),
+          stepIndex: i,
+          url: cap.url,
+          metadata: {
+            axeId: v.id,
+            helpUrl: v.helpUrl,
+            sampleTargets: v.sampleTargets,
+          },
+        });
+      }
+    }
+    const personaHits = matchAxeViolationsToPersonaRules(
+      cap.axe.violations,
+      personaRules,
+    );
+    for (const hit of personaHits) {
+      failures.push({
+        reason: FailureReason.ABANDONED_BY_PERSONA,
+        message: `${persona.id} would abandon: rule "${hit.rule}" matches axe "${hit.axeId}" (${hit.violation.help})`,
+        timestamp: Date.now(),
+        stepIndex: i,
+        url: cap.url,
+        metadata: {
+          personaRule: hit.rule,
+          axeId: hit.axeId,
+          helpUrl: hit.violation.helpUrl,
+        },
+      });
+    }
   }
 
   await writeFile(
