@@ -1,6 +1,9 @@
 import { readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { loadAllSurfaces } from "../surface/loader.ts";
+import { chromium } from "playwright";
+import { runAxe } from "../runner/axe-scan.ts";
+import { loadAllSurfaces, loadSurface } from "../surface/loader.ts";
+import { resolveAuthStatePath } from "../auth/capture.ts";
 import type { RunReport } from "./schema.ts";
 import { findLatestRunDir } from "./build.ts";
 
@@ -10,12 +13,20 @@ export interface SurfaceRun {
   report: RunReport;
 }
 
+export interface CrossSurfaceVetting {
+  status: "verified" | "regressed" | "subjective" | "could_not_replay" | "unverified";
+  surfacesReplayed: number;
+  surfacesRePassed: number;
+  note: string;
+}
+
 export interface CrossSurfacePattern {
   signature: string;
   title: string;
   surfaces: string[]; // surface ids the signature occurred on
   totalCount: number; // total findings across all surfaces matching this signature
   personas: string[]; // distinct personas across all surfaces
+  vetting?: CrossSurfaceVetting;
 }
 
 export interface CrossSurfaceReport {
@@ -179,6 +190,21 @@ export async function discoverLatestRunsPerSurface(
   return result;
 }
 
+function badgeFor(status: CrossSurfaceVetting["status"]): string {
+  switch (status) {
+    case "verified":
+      return "**[VERIFIED]**";
+    case "regressed":
+      return "_[regressed]_";
+    case "subjective":
+      return "_[subjective]_";
+    case "could_not_replay":
+      return "_[could_not_replay]_";
+    case "unverified":
+      return "_[unverified]_";
+  }
+}
+
 export function renderCrossSurfaceMarkdown(report: CrossSurfaceReport): string {
   const lines: string[] = [];
   lines.push(`# Cross-surface gauntlet report`);
@@ -204,11 +230,14 @@ export function renderCrossSurfaceMarkdown(report: CrossSurfaceReport): string {
   if (report.patterns.length === 0) {
     lines.push(`_No signature spans multiple surfaces. Each surface has its own bug shape._`);
   } else {
-    lines.push(`| Signature | Surfaces | Total | Personas |`);
-    lines.push(`|---|---|---:|---|`);
+    lines.push(`| Signature | Surfaces | Total | Personas | Vetting |`);
+    lines.push(`|---|---|---:|---|---|`);
     for (const p of report.patterns) {
+      const vet = p.vetting
+        ? `${badgeFor(p.vetting.status)} ${p.vetting.surfacesRePassed}/${p.vetting.surfacesReplayed}`
+        : "_unverified_";
       lines.push(
-        `| \`${p.signature}\` <br/> ${p.title.replace(/\|/g, "\\|").slice(0, 80)} | ${p.surfaces.join(", ")} | ${p.totalCount} | ${p.personas.join(", ")} |`,
+        `| \`${p.signature}\` <br/> ${p.title.replace(/\|/g, "\\|").slice(0, 80)} | ${p.surfaces.join(", ")} | ${p.totalCount} | ${p.personas.join(", ")} | ${vet} |`,
       );
     }
   }
@@ -243,6 +272,8 @@ export interface BuildCrossSurfaceOptions {
   cwd: string;
   surfaceIds?: string[];
   runDirs?: string[]; // override: use these explicit run dirs
+  vet?: boolean; // also run vetCrossSurfacePatterns() to verify top axe patterns
+  vetTopN?: number;
 }
 
 export interface BuildCrossSurfaceResult {
@@ -274,6 +305,12 @@ export async function buildCrossSurfaceReport(
     });
   }
   const report = buildCrossSurface(runs);
+  if (opts.vet) {
+    report.patterns = await vetCrossSurfacePatterns(report.patterns, {
+      cwd: opts.cwd,
+      ...(opts.vetTopN !== undefined ? { topN: opts.vetTopN } : {}),
+    });
+  }
   const md = renderCrossSurfaceMarkdown(report);
   const outDir = join(opts.cwd, ".gauntlet");
   const mdPath = join(outDir, "CROSS-REPORT.md");
@@ -281,6 +318,141 @@ export async function buildCrossSurfaceReport(
   await writeFile(mdPath, md, "utf8");
   await writeFile(jsonPath, JSON.stringify(report, null, 2), "utf8");
   return { markdownPath: mdPath, jsonPath, report };
+}
+
+export interface VetCrossSurfaceOptions {
+  cwd: string;
+  topN?: number; // limit how many patterns to vet (cost control). Default 8.
+  headless?: boolean;
+  timeoutMs?: number;
+}
+
+/**
+ * Cross-surface vetting: for each axe pattern in the rollup, visit each
+ * surface's base_url once, run axe, check whether the axe rule still fires.
+ * Tags the pattern verified iff it re-fires on a majority of surfaces.
+ * Non-axe patterns (console_error, abandoned_by_persona, etc) are tagged
+ * subjective since they need flow-replay or persona judgment.
+ */
+export async function vetCrossSurfacePatterns(
+  patterns: CrossSurfacePattern[],
+  opts: VetCrossSurfaceOptions,
+): Promise<CrossSurfacePattern[]> {
+  const topN = opts.topN ?? 8;
+  const headless = opts.headless ?? true;
+  const timeoutMs = opts.timeoutMs ?? 20_000;
+  const targets = patterns.slice(0, topN);
+  if (targets.length === 0) return patterns;
+
+  // Resolve every surface mentioned across the top patterns.
+  const surfaceIds = new Set<string>();
+  for (const p of targets) for (const s of p.surfaces) surfaceIds.add(s);
+  const surfaceMeta: { id: string; baseUrl: string; storageState?: string }[] = [];
+  for (const id of surfaceIds) {
+    try {
+      const s = await loadSurface(id, opts.cwd);
+      if (!s.base_url) continue;
+      const auth = resolveAuthStatePath(opts.cwd, s.auth_state);
+      surfaceMeta.push({
+        id,
+        baseUrl: s.base_url,
+        ...(auth ? { storageState: auth } : {}),
+      });
+    } catch {
+      /* surface yaml missing; skip */
+    }
+  }
+
+  if (surfaceMeta.length === 0) {
+    return patterns.map((p) => ({
+      ...p,
+      vetting: {
+        status: "could_not_replay",
+        surfacesReplayed: 0,
+        surfacesRePassed: 0,
+        note: "no surface yamls with base_url found",
+      },
+    }));
+  }
+
+  // Visit every surface once, collect axe-rule sets.
+  const axeRulesBySurface = new Map<string, Set<string>>();
+  const navFailures = new Map<string, string>();
+  const browser = await chromium.launch({ headless });
+  try {
+    for (const s of surfaceMeta) {
+      const context = await browser.newContext(
+        s.storageState ? { storageState: s.storageState } : {},
+      );
+      const page = await context.newPage();
+      try {
+        await page.goto(s.baseUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
+        await page.waitForLoadState("networkidle", { timeout: 8_000 }).catch(() => undefined);
+        const axe = await runAxe(page);
+        axeRulesBySurface.set(s.id, new Set(axe.violations.map((v) => v.id)));
+      } catch (err) {
+        navFailures.set(s.id, err instanceof Error ? err.message : String(err));
+      } finally {
+        await context.close().catch(() => undefined);
+      }
+    }
+  } finally {
+    await browser.close().catch(() => undefined);
+  }
+
+  // Stamp every pattern.
+  const vetted = patterns.map((p) => ({ ...p }));
+  for (let i = 0; i < vetted.length; i++) {
+    const p = vetted[i]!;
+    if (i >= topN) {
+      p.vetting = {
+        status: "unverified",
+        surfacesReplayed: 0,
+        surfacesRePassed: 0,
+        note: `not in top ${topN} patterns; skipped`,
+      };
+      continue;
+    }
+    if (!p.signature.startsWith("axe:")) {
+      p.vetting = {
+        status: "subjective",
+        surfacesReplayed: 0,
+        surfacesRePassed: 0,
+        note: "non-axe pattern; cross-surface vetting needs flow_replay (not yet implemented)",
+      };
+      continue;
+    }
+    const ruleId = p.signature.replace(/^axe:/, "");
+    let surfacesReplayed = 0;
+    let surfacesRePassed = 0;
+    const notes: string[] = [];
+    for (const sid of p.surfaces) {
+      if (navFailures.has(sid)) {
+        notes.push(`${sid}: nav failed (${navFailures.get(sid)})`);
+        continue;
+      }
+      const rules = axeRulesBySurface.get(sid);
+      if (!rules) {
+        notes.push(`${sid}: no surface base_url`);
+        continue;
+      }
+      surfacesReplayed += 1;
+      if (rules.has(ruleId)) surfacesRePassed += 1;
+    }
+    const majority = surfacesReplayed > 0 && surfacesRePassed * 2 >= surfacesReplayed;
+    p.vetting = {
+      status:
+        surfacesReplayed === 0
+          ? "could_not_replay"
+          : majority
+            ? "verified"
+            : "regressed",
+      surfacesReplayed,
+      surfacesRePassed,
+      note: notes.length > 0 ? notes.join("; ") : `${surfacesRePassed}/${surfacesReplayed} surfaces re-fired`,
+    };
+  }
+  return vetted;
 }
 
 // Re-export findLatestRunDir for consumers that want to mix-and-match.

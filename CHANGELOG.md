@@ -8,6 +8,29 @@ The format roughly follows [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Added
 
+- **`gauntlet bench`: WebVoyager-style benchmark harness.** Loops over a
+  fixed list of public SaaS landing pages
+  (`bench/sites.json`, 12 sites by default), runs `gauntlet seed` + flow
+  execution + per-site report for each, and writes a single aggregate
+  table to `.gauntlet/bench/bench-<date>.md`. Filters: `--limit N`,
+  `--only <names>`. Each site gets its own scratch `.gauntlet/` under
+  `bench-tmp/<name>/` so the bench doesn't pollute the host repo.
+  Per-site report files are unvetted at bench scale. Closes
+  `gauntlet-tn8.4`.
+- **`gauntlet seed`: non-interactive bootstrap.** Runs Phase A
+  (surfaces) + Phase B (personas distributed across surfaces) + Phase C
+  (flows per persona) end-to-end without the curate-loop prompts.
+  Replaces project-specific `scripts/dogfood-*.ts` boilerplate. Usage:
+  `gauntlet seed [<cwd>] --url <urls> [--personas N] [--flows N]`.
+  Closes `gauntlet-s68`.
+- **`gauntlet cross-report --vet`: cross-surface vetter.** For each
+  top-N axe pattern in the rollup, launches one Playwright browser,
+  visits each surface's `base_url` once, runs axe, and tags the pattern
+  `verified` iff its rule re-fires on a majority of surfaces (`regressed`
+  otherwise). Honors per-surface `auth_state` for behind-login surfaces.
+  Non-axe patterns (console_error, abandoned_by_persona) are tagged
+  `subjective` since they need flow-replay. CROSS-REPORT.md gets a
+  per-pattern vetting badge column. Closes `gauntlet-sis`.
 - **Auto-probe common URL paths during init.** `gauntlet init --url <site>`
   now also probes `/admin`, `/admin/login`, `/login`, `/signin`,
   `/dashboard`, `/pricing`, `/app`, and `/_/login` on each user-supplied

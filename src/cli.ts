@@ -13,6 +13,8 @@ import { loadAllSurfaces, loadSurface, writeSurface } from "./surface/loader.ts"
 import { captureAuth, resolveAuthStatePath } from "./auth/capture.ts";
 import { buildReport, findLatestRunDir } from "./report/build.ts";
 import { buildCrossSurfaceReport } from "./report/cross-surface.ts";
+import { seedProject } from "./init/seed.ts";
+import { loadSitesFile, runBench, saveBenchReport } from "./bench/runner.ts";
 import { DEFAULT_MODEL, pickProvider } from "./ai/index.ts";
 import { configureAiCache, getAiCache } from "./ai/cache.ts";
 import { readProject } from "./init/project-reader.ts";
@@ -465,6 +467,118 @@ async function cmdReport(args: ParsedArgs): Promise<void> {
   }
 }
 
+async function cmdBench(args: ParsedArgs): Promise<void> {
+  const cwd = process.cwd();
+  const sitesPath =
+    typeof args.flags.sites === "string"
+      ? args.flags.sites
+      : join(cwd, "bench", "sites.json");
+  const limit = args.flags.limit ? Number(args.flags.limit) : undefined;
+  const onlyNames = splitCsv(args.flags.only);
+  const personasPerSite = args.flags.personas ? Number(args.flags.personas) : 2;
+  const flowsPerPersona = args.flags.flows ? Number(args.flags.flows) : 2;
+  const model = typeof args.flags.model === "string" ? args.flags.model : DEFAULT_MODEL;
+  const cacheEnabled = args.flags["no-cache"] !== true;
+
+  const file = await loadSitesFile(sitesPath);
+  let sites = file.sites;
+  if (onlyNames.length > 0) {
+    const set = new Set(onlyNames);
+    sites = sites.filter((s) => set.has(s.name));
+  }
+  if (limit !== undefined) sites = sites.slice(0, limit);
+
+  console.log(`gauntlet bench`);
+  console.log(`  sites file: ${sitesPath}`);
+  console.log(`  sites:      ${sites.length} (${sites.map((s) => s.name).join(", ")})`);
+  console.log(`  personas:   ${personasPerSite} per site`);
+  console.log(`  flows:      ${flowsPerPersona} per persona`);
+  console.log(`  model:      ${model}`);
+
+  configureAiCache({ enabled: cacheEnabled, cwd });
+  const provider = pickProvider(model);
+  const benchRoot = join(cwd, "bench-tmp");
+
+  const result = await runBench({
+    provider,
+    sites,
+    benchRoot,
+    personasPerSite,
+    flowsPerPersona,
+    log: (line) => console.log(line),
+  });
+
+  const out = await saveBenchReport({
+    outDir: join(cwd, ".gauntlet", "bench"),
+    result,
+  });
+  console.log(`\n=== bench complete ===`);
+  console.log(`  sites ok:     ${result.totals.sitesOk}`);
+  console.log(`  sites error:  ${result.totals.sitesError}`);
+  console.log(`  findings:     ${result.totals.findings}`);
+  console.log(`  duration:     ${Math.round((result.finishedAt - result.startedAt) / 1000)}s`);
+  console.log(`\nmarkdown: ${out.markdownPath}`);
+  console.log(`json:     ${out.jsonPath}`);
+}
+
+async function cmdSeed(args: ParsedArgs): Promise<void> {
+  const cwd =
+    typeof args.positional[0] === "string"
+      ? args.positional[0]
+      : typeof args.flags.cwd === "string"
+        ? args.flags.cwd
+        : process.cwd();
+  const urls = splitCsv(args.flags.url);
+  const model = typeof args.flags.model === "string" ? args.flags.model : DEFAULT_MODEL;
+  const numPersonas = args.flags.personas ? Number(args.flags.personas) : 4;
+  const flowsPerPersona = args.flags.flows ? Number(args.flags.flows) : 2;
+  const cacheEnabled = args.flags["no-cache"] !== true;
+
+  if (urls.length === 0) {
+    console.error("error: gauntlet seed needs at least one --url <url>");
+    console.error("usage: gauntlet seed [<cwd>] --url <url> [<url> ...] [--personas N] [--flows N]");
+    process.exit(2);
+  }
+
+  console.log(`gauntlet seed`);
+  console.log(`  cwd:      ${cwd}`);
+  console.log(`  urls:     ${urls.join(", ")}`);
+  console.log(`  personas: ${numPersonas}`);
+  console.log(`  flows:    ${flowsPerPersona}`);
+  console.log(`  model:    ${model}`);
+  console.log(`  cache:    ${cacheEnabled ? "on" : "off"}`);
+  console.log("");
+
+  configureAiCache({ enabled: cacheEnabled, cwd });
+  const provider = pickProvider(model);
+
+  const result = await seedProject({
+    cwd,
+    provider,
+    urls,
+    numPersonas,
+    flowsPerPersona,
+    log: (line) => console.log(line),
+  });
+
+  console.log(`\nseed complete.`);
+  console.log(`  surfaces: ${result.surfaces.length}`);
+  console.log(`  personas: ${result.personas.length}`);
+  console.log(`  flows:    ${result.flows.length}`);
+
+  const authNeeded = result.surfaces.filter((s) => s.requires_auth);
+  if (authNeeded.length > 0) {
+    console.log(`\nnext: capture auth for behind-login surfaces:`);
+    for (const s of authNeeded) {
+      console.log(`  gauntlet auth ${s.id}${s.login_url ? ` --url ${s.login_url}` : ""}`);
+    }
+  }
+  console.log(`\nthen run gauntlet against each surface:`);
+  for (const s of result.surfaces) {
+    console.log(`  gauntlet run --surface ${s.id}`);
+  }
+}
+
 async function cmdCrossReport(args: ParsedArgs): Promise<void> {
   const cwd = process.cwd();
   const explicitRuns = splitCsv(args.flags.runs);
@@ -472,6 +586,10 @@ async function cmdCrossReport(args: ParsedArgs): Promise<void> {
   const opts: Parameters<typeof buildCrossSurfaceReport>[0] = { cwd };
   if (explicitRuns.length > 0) opts.runDirs = explicitRuns;
   if (surfaceIds.length > 0) opts.surfaceIds = surfaceIds;
+  if (args.flags.vet === true) opts.vet = true;
+  if (typeof args.flags["vet-top"] === "string") opts.vetTopN = Number(args.flags["vet-top"]);
+
+  if (opts.vet) console.log("gauntlet cross-report (vetting enabled - launching Playwright)");
 
   const built = await buildCrossSurfaceReport(opts);
   console.log(`gauntlet cross-report`);
@@ -734,7 +852,9 @@ usage:
   gauntlet report [<run-dir>] [--run <path>] [--no-vet]
   gauntlet surfaces
   gauntlet auth <surface-id> [--url <login-url>]
-  gauntlet cross-report [--surfaces <ids>] [--runs <dirs>]
+  gauntlet seed [<cwd>] --url <urls> [--personas N] [--flows N]
+  gauntlet bench [--sites <path>] [--limit N] [--only <names>] [--personas N]
+  gauntlet cross-report [--surfaces <ids>] [--runs <dirs>] [--vet] [--vet-top N]
   gauntlet list
   gauntlet help
 
@@ -828,6 +948,12 @@ async function main(): Promise<void> {
       break;
     case "cross-report":
       await cmdCrossReport(args);
+      break;
+    case "seed":
+      await cmdSeed(args);
+      break;
+    case "bench":
+      await cmdBench(args);
       break;
     case "list":
       await cmdList();

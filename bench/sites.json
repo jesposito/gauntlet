@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "description": "Public SaaS / dev-tool landing pages used by `gauntlet bench`. Aim: a stable, public, no-auth set that exercises the surface generator and produces a stable axe / persona-abandonment baseline week-over-week. Keep this list churn-low; add via PR.",
+  "sites": [
+    { "name": "linear", "url": "https://linear.app" },
+    { "name": "vercel", "url": "https://vercel.com" },
+    { "name": "supabase", "url": "https://supabase.com" },
+    { "name": "fly", "url": "https://fly.io" },
+    { "name": "render", "url": "https://render.com" },
+    { "name": "stripe", "url": "https://stripe.com" },
+    { "name": "anthropic", "url": "https://anthropic.com" },
+    { "name": "openai", "url": "https://openai.com" },
+    { "name": "playwright", "url": "https://playwright.dev" },
+    { "name": "deno", "url": "https://deno.com" },
+    { "name": "bun", "url": "https://bun.sh" },
+    { "name": "neon", "url": "https://neon.tech" }
+  ]
+}

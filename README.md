@@ -92,7 +92,8 @@ Actions: accept, reject, edit in `$EDITOR`, regenerate this slot, write-my-own, 
 ### Flags
 
 ```
-gauntlet init         [--url <urls>] [--model <id>] [--count N] [--no-cache]
+gauntlet init         [--url <urls>] [--model <id>] [--count N] [--no-cache] [--no-probe]
+gauntlet seed         [<cwd>] --url <urls> [--personas N] [--flows N]
 gauntlet flows        [--personas <ids>] [--model <id>] [--count N] [--url <url>]
 gauntlet run          [<url> | --url <url> | --surface <id> | --pr <num>]
                       [--personas <ids>]
@@ -103,7 +104,9 @@ gauntlet run          [<url> | --url <url> | --surface <id> | --pr <num>]
                       [--no-cache] [--no-flows] [--no-report]
 gauntlet auth         <surface-id> [--url <login-url>]
 gauntlet surfaces
-gauntlet cross-report [--surfaces <ids>] [--runs <dirs>]
+gauntlet cross-report [--surfaces <ids>] [--runs <dirs>] [--vet] [--vet-top N]
+gauntlet bench        [--sites <path>] [--limit N] [--only <names>]
+                      [--personas N] [--flows N]
 gauntlet report       [<run-dir>] [--run <path>] [--no-vet]
 gauntlet list
 ```
@@ -187,6 +190,26 @@ top cross-surface patterns:
 ```
 
 External-resource console errors (third-party hosts like `fonts.googleapis.com`) are auto-tagged and downgraded to `severity=minor` so they don't drown out real product findings.
+
+## Benchmark
+
+`gauntlet bench` loops over a fixed list of public SaaS / dev-tool landing pages and produces one aggregate report. Each site is seeded (non-interactive `init` + `flows`) and run end-to-end; per-site scratch dirs live under `bench-tmp/<name>/.gauntlet/`. Output: `.gauntlet/bench/bench-<date>.md` with a table of `surfaces × personas × flows × findings × duration` per site.
+
+```bash
+# Default 12 sites (linear, vercel, supabase, fly, stripe, anthropic, ...).
+gauntlet bench
+
+# A subset.
+gauntlet bench --only linear,vercel,stripe
+
+# First 3 from the list (smoke test).
+gauntlet bench --limit 3
+
+# Custom site list.
+gauntlet bench --sites ./my-sites.json
+```
+
+Designed to be run weekly via GitHub Actions for a leaderboard / README badge ("Gauntlet found X bugs across N landing pages on YYYY-MM-DD"). Add new sites by PR to `bench/sites.json`.
 
 ## How accessibility findings are surfaced
 
