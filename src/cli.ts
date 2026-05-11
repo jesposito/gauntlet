@@ -8,6 +8,7 @@ import {
 } from "./persona/loader.ts";
 import { runPersona } from "./runner/browser.ts";
 import { DEFAULT_MODEL, pickProvider } from "./ai/index.ts";
+import { configureAiCache } from "./ai/cache.ts";
 import { readProject } from "./init/project-reader.ts";
 import { loadTemplates } from "./persona/templates.ts";
 import {
@@ -134,12 +135,15 @@ async function cmdInit(args: ParsedArgs): Promise<void> {
   const model =
     typeof args.flags.model === "string" ? args.flags.model : DEFAULT_MODEL;
   const requested = args.flags.count ? Number(args.flags.count) : 10;
+  const cacheEnabled = args.flags["no-cache"] !== true;
 
   console.log(`gauntlet init`);
   console.log(`  cwd:    ${cwd}`);
   console.log(`  model:  ${model}`);
+  console.log(`  cache:  ${cacheEnabled ? "on (.gauntlet/cache/ai/)" : "off"}`);
   if (url) console.log(`  url:    ${url}`);
 
+  configureAiCache({ enabled: cacheEnabled, cwd });
   const provider = pickProvider(model);
 
   console.log("\n[Phase A] reading project context...");
@@ -209,6 +213,7 @@ init flags:
   --url <url>        landing page to fetch for product context (optional)
   --model <id>       AI model for persona generation (default ${DEFAULT_MODEL})
   --count <n>        candidate count to request from AI (default 10)
+  --no-cache         disable AI response cache (default: cache on)
 
 run flags:
   --personas <ids>   comma-separated persona ids

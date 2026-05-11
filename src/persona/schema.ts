@@ -22,6 +22,18 @@ export const InputSchema = z.enum([
   "screen-reader",
 ]);
 
+export const OceanSchema = z
+  .object({
+    openness: z.number().int().min(0).max(100),
+    conscientiousness: z.number().int().min(0).max(100),
+    extraversion: z.number().int().min(0).max(100),
+    agreeableness: z.number().int().min(0).max(100),
+    neuroticism: z.number().int().min(0).max(100),
+  })
+  .describe(
+    "Big Five (OCEAN) personality profile, 0-100 per axis. Shapes voice and abandonment behavior.",
+  );
+
 export const CharacterSchema = z.object({
   name: z.string(),
   age: z.number().int().positive().optional(),
@@ -35,6 +47,7 @@ export const CharacterSchema = z.object({
     .describe(
       "How they speak when frustrated or pleased. Used to shape the report quote tone.",
     ),
+  personality: OceanSchema.optional(),
 });
 
 export const BehaviorSchema = z.object({
@@ -80,3 +93,4 @@ export type Behavior = z.infer<typeof BehaviorSchema>;
 export type Device = z.infer<typeof DeviceSchema>;
 export type Network = z.infer<typeof NetworkSchema>;
 export type Input = z.infer<typeof InputSchema>;
+export type Ocean = z.infer<typeof OceanSchema>;

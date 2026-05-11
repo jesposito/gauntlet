@@ -10,6 +10,12 @@ character:
     Warm, patient at first, gets quietly frustrated when things don't behave
     the way she expects. Talks to herself. Doesn't blame herself out loud, but
     will give up rather than make a fuss.
+  personality:
+    openness: 35
+    conscientiousness: 80
+    extraversion: 55
+    agreeableness: 85
+    neuroticism: 50
 behavior:
   goals:
     - Find a chicken recipe I can cook tonight

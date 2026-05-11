@@ -26,7 +26,14 @@ const SCHEMA_EXAMPLE = `{
         "name": "Full Name",
         "age": 34,
         "context": "1-2 sentences: who they are and what they want from THIS product.",
-        "voice": "How they talk when frustrated or pleased."
+        "voice": "How they talk when frustrated or pleased.",
+        "personality": {
+          "openness": 60,
+          "conscientiousness": 75,
+          "extraversion": 40,
+          "agreeableness": 65,
+          "neuroticism": 55
+        }
       },
       "behavior": {
         "goals": ["Concrete task 1 specific to this product", "Concrete task 2"],
@@ -56,6 +63,7 @@ Rules:
 - 8-12 candidates total
 - At least 3 core, at least 3 edge
 - Each persona must have a concrete name, age, context (1-2 sentences about who they are and what they want from THIS product specifically), and voice
+- Include a personality (Big Five / OCEAN) profile with each axis 0-100. Make the axes consistent with the persona: e.g. a power-user-fuzzer is high openness + low agreeableness; a low-digital-confidence retiree is low openness + high neuroticism
 - behavior.goals must be specific to THIS product, not generic
 - ids must be lowercase kebab-case, unique
 - rationale: one sentence explaining why this persona is a useful stress test for this product

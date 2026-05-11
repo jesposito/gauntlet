@@ -1,4 +1,5 @@
 import type { ZodSchema } from "zod";
+import { getAiCache } from "./cache.ts";
 
 export interface AiMessage {
   role: "system" | "user" | "assistant";
@@ -32,10 +33,37 @@ export function registerProvider(factory: ProviderFactory): void {
   factories.push(factory);
 }
 
+class CachingProvider implements AiProvider {
+  readonly name: string;
+  readonly model: string;
+  private readonly inner: AiProvider;
+
+  constructor(inner: AiProvider) {
+    this.inner = inner;
+    this.name = inner.name;
+    this.model = inner.model;
+  }
+
+  async propose<T>(opts: ProposeOptions<T>): Promise<T> {
+    const cache = getAiCache();
+    if (!cache?.enabled) return this.inner.propose(opts);
+
+    const inputs = cache.inputsFor(this.inner.name, this.inner.model, opts);
+    const hit = await cache.get<T>(inputs);
+    if (hit !== undefined) {
+      const validated = opts.schema.safeParse(hit);
+      if (validated.success) return validated.data;
+    }
+    const out = await this.inner.propose(opts);
+    await cache.set(inputs, out);
+    return out;
+  }
+}
+
 export function pickProvider(model: string): AiProvider {
   for (const f of factories) {
     if (f.modelPrefixes.some((p) => model.startsWith(p))) {
-      return f.create(model);
+      return new CachingProvider(f.create(model));
     }
   }
   throw new Error(
