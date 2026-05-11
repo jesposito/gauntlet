@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { planProbeCandidates, probeAll } from "./probe-paths.ts";
 
 const MAX_TOTAL_BYTES = 30_000;
 const MAX_README_BYTES = 12_000;
@@ -165,6 +166,13 @@ export interface ReadProjectOptions {
   cwd: string;
   url?: string;
   urls?: string[];
+  /**
+   * Probe a small set of common URL paths (/admin, /login, /pricing, ...) on
+   * each user-supplied origin to surface auth-walled views the user didn't
+   * pass explicitly. Defaults true when at least one URL is supplied.
+   * Skips paths the user already covered and silently drops 404s.
+   */
+  probePaths?: boolean;
 }
 
 export async function readProject(opts: ReadProjectOptions): Promise<ProjectContext> {
@@ -188,6 +196,18 @@ export async function readProject(opts: ReadProjectOptions): Promise<ProjectCont
   const landings: LandingPageContext[] = [];
   for (const u of urls) {
     landings.push(await fetchLanding(u));
+  }
+
+  // Auto-probe common paths on the user-supplied origins. Surfaces auth-walled
+  // admin / pricing / dashboard views the user didn't pass explicitly.
+  // Defaults on when at least one URL is supplied.
+  const probeEnabled = opts.probePaths ?? urls.length > 0;
+  if (probeEnabled && urls.length > 0) {
+    const candidates = planProbeCandidates(urls);
+    const interesting = await probeAll(candidates);
+    for (const r of interesting) {
+      landings.push(await fetchLanding(r.url));
+    }
   }
 
   const ctx: ProjectContext = {

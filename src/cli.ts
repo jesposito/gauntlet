@@ -583,18 +583,20 @@ async function cmdInit(args: ParsedArgs): Promise<void> {
     typeof args.flags.model === "string" ? args.flags.model : DEFAULT_MODEL;
   const requested = args.flags.count ? Number(args.flags.count) : 10;
   const cacheEnabled = args.flags["no-cache"] !== true;
+  const probeEnabled = args.flags["no-probe"] !== true && urls.length > 0;
 
   console.log(`gauntlet init`);
   console.log(`  cwd:    ${cwd}`);
   console.log(`  model:  ${model}`);
   console.log(`  cache:  ${cacheEnabled ? "on (.gauntlet/cache/ai/)" : "off"}`);
+  console.log(`  probe:  ${probeEnabled ? "on (/admin, /login, /pricing, ...)" : "off"}`);
   if (urls.length > 0) console.log(`  urls:   ${urls.join(", ")}`);
 
   configureAiCache({ enabled: cacheEnabled, cwd });
   const provider = pickProvider(model);
 
   console.log("\n[Phase A] reading project context...");
-  const project = await readProject({ cwd, urls });
+  const project = await readProject({ cwd, urls, probePaths: probeEnabled });
   const reachable = project.landings.filter((l) => l.reachable).length;
   const unreachable = project.landings.length - reachable;
   console.log(
@@ -745,6 +747,11 @@ init flags:
   --model <id>       AI model for persona generation (default ${DEFAULT_MODEL})
   --count <n>        candidate count to request from AI (default 10)
   --no-cache         disable AI response cache (default: cache on)
+  --no-probe         skip auto-probing /admin, /login, /pricing, /dashboard,
+                     etc. on each --url origin (probe is on by default; 404s
+                     are dropped silently, 200/401/403 are fed to the surface
+                     AI so it can propose admin/internal surfaces you didn't
+                     pass explicitly)
 
 auth flags:
   --url <url>        login page URL (defaults to surface.login_url or surface.base_url)

@@ -8,6 +8,14 @@ The format roughly follows [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Added
 
+- **Auto-probe common URL paths during init.** `gauntlet init --url <site>`
+  now also probes `/admin`, `/admin/login`, `/login`, `/signin`,
+  `/dashboard`, `/pricing`, `/app`, and `/_/login` on each user-supplied
+  origin. 200 / 301 / 302 / 401 / 403 responses are fetched as additional
+  landings and fed to the surface generator so it can propose
+  admin/internal surfaces without the user having to know the right URL.
+  404s and network errors are dropped silently. Disable with `--no-probe`.
+  Closes `gauntlet-z1q`.
 - **Cross-surface report.** New `gauntlet cross-report [--surfaces <ids>]
   [--runs <dirs>]` aggregates the latest run per curated surface and
   surfaces the signatures that span ≥2 surfaces — the highest-leverage
