@@ -16,6 +16,9 @@ import {
   type PersonaCandidate,
 } from "./init/persona-generator.ts";
 import { curate, listCuratedIds } from "./init/curate.ts";
+import { generateFlows } from "./init/flow-generator.ts";
+import { curateFlows } from "./init/curate-flows.ts";
+import { listFlows, loadFlowsForPersona } from "./flow/loader.ts";
 
 interface ParsedArgs {
   command: string;
@@ -108,10 +111,16 @@ async function cmdList(): Promise<void> {
     console.log("curated personas (.gauntlet/personas/):");
     for (const id of curated) {
       const p = await loadPersona(id);
+      const flows = await loadFlowsForPersona(id);
+      const flowSuffix = flows.length > 0 ? `  [${flows.length} flow${flows.length === 1 ? "" : "s"}]` : "";
       console.log(
-        `  ${id.padEnd(28)} ${p.character.name} (${p.character.age ?? "?"}) - ${p.character.context.split("\n")[0]}`,
+        `  ${id.padEnd(28)} ${p.character.name} (${p.character.age ?? "?"})${flowSuffix}`,
       );
     }
+  }
+  const allFlows = await listFlows();
+  if (allFlows.length === 0 && curated.length > 0) {
+    console.log("\nno flows yet. run `gauntlet flows` to design test flows per persona.");
   }
   const builtin = await listBuiltinPersonas();
   if (builtin.length > 0) {
@@ -193,11 +202,76 @@ async function cmdInit(args: ParsedArgs): Promise<void> {
   if (result.accepted.length > 0) {
     console.log(`personas written to ${join(cwd, ".gauntlet/personas")}/`);
     console.log(
-      "next: `gauntlet run <url> --personas " +
+      "next: `gauntlet flows --personas " +
         result.accepted.map((p) => p.id).join(",") +
-        "`",
+        "` to design test flows per persona.",
     );
   }
+}
+
+async function cmdFlows(args: ParsedArgs): Promise<void> {
+  const cwd = process.cwd();
+  const model =
+    typeof args.flags.model === "string" ? args.flags.model : DEFAULT_MODEL;
+  const url = typeof args.flags.url === "string" ? args.flags.url : undefined;
+  const count = args.flags.count ? Number(args.flags.count) : 3;
+  const cacheEnabled = args.flags["no-cache"] !== true;
+
+  const personaArg = args.flags.personas;
+  let personaIds: string[];
+  if (!personaArg || personaArg === true) {
+    personaIds = await listCuratedIds(cwd);
+    if (personaIds.length === 0) {
+      console.error("error: no curated personas. run `gauntlet init` first.");
+      process.exit(2);
+    }
+  } else {
+    personaIds = String(personaArg).split(",").map((s) => s.trim()).filter(Boolean);
+  }
+
+  console.log(`gauntlet flows`);
+  console.log(`  cwd:      ${cwd}`);
+  console.log(`  model:    ${model}`);
+  console.log(`  personas: ${personaIds.join(", ")}`);
+  console.log(`  cache:    ${cacheEnabled ? "on" : "off"}`);
+
+  configureAiCache({ enabled: cacheEnabled, cwd });
+  const provider = pickProvider(model);
+
+  console.log("\n[Phase A] reading project context...");
+  const project = await readProject({ cwd, ...(url ? { url } : {}) });
+  console.log(
+    `  project=${project.projectName ?? "(unknown)"} bytes=${project.totalBytes}`,
+  );
+
+  const summary: { persona: string; accepted: number; rejected: number }[] = [];
+
+  for (const id of personaIds) {
+    const persona = await loadPersona(id, cwd);
+    console.log(`\n[Phase C] ${persona.id} (${persona.character.name})`);
+    const flows = await generateFlows({ provider, project, persona, count });
+    console.log(`  AI proposed ${flows.length} flow${flows.length === 1 ? "" : "s"}`);
+
+    const result = await curateFlows(flows, {
+      cwd,
+      regenerate: async () => {
+        console.log("regenerating flows for this persona...");
+        return generateFlows({ provider, project, persona, count });
+      },
+    });
+
+    summary.push({
+      persona: persona.id,
+      accepted: result.accepted.length,
+      rejected: result.rejected.length,
+    });
+  }
+
+  console.log("\nflows summary:");
+  for (const s of summary) {
+    console.log(`  ${s.persona.padEnd(28)} accepted=${s.accepted} rejected=${s.rejected}`);
+  }
+  console.log(`\nflows written to ${join(cwd, ".gauntlet/flows")}/`);
 }
 
 function cmdHelp(): void {
@@ -205,6 +279,7 @@ function cmdHelp(): void {
 
 usage:
   gauntlet init [--url <url>] [--model <id>] [--count N]
+  gauntlet flows [--personas <id[,id...]>] [--model <id>] [--count N] [--url <url>]
   gauntlet run <url> --personas <id[,id...]> [--steps N] [--headed]
   gauntlet list
   gauntlet help
@@ -214,6 +289,13 @@ init flags:
   --model <id>       AI model for persona generation (default ${DEFAULT_MODEL})
   --count <n>        candidate count to request from AI (default 10)
   --no-cache         disable AI response cache (default: cache on)
+
+flows flags:
+  --personas <ids>   curated persona ids to design flows for (default: all)
+  --model <id>       AI model for flow generation (default ${DEFAULT_MODEL})
+  --count <n>        flows per persona to propose (default 3)
+  --url <url>        landing page to include in product context (optional)
+  --no-cache         disable AI response cache
 
 run flags:
   --personas <ids>   comma-separated persona ids
@@ -230,6 +312,9 @@ async function main(): Promise<void> {
       break;
     case "init":
       await cmdInit(args);
+      break;
+    case "flows":
+      await cmdFlows(args);
       break;
     case "list":
       await cmdList();
