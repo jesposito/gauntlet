@@ -1,5 +1,6 @@
 import { AxeBuilder } from "@axe-core/playwright";
 import type { Page } from "playwright";
+import { classifyAxeViolation } from "./third-party-axe.ts";
 
 export interface AxeViolation {
   id: string;
@@ -8,6 +9,17 @@ export interface AxeViolation {
   helpUrl: string;
   nodeCount: number;
   sampleTargets: string[];
+  /**
+   * True when every / a majority of the violating nodes live inside a
+   * third-party iframe (YouTube, Stripe Elements, etc) that the host can't
+   * fix. Generator downgrades these to severity=minor so they don't drown
+   * out fixable findings.
+   */
+  thirdParty?: boolean;
+  /** Best-effort embed-host label (youtube, stripe-elements, iframe, ...). */
+  thirdPartySource?: string;
+  /** Count of third-party nodes among the violation's nodes. */
+  thirdPartyNodeCount?: number;
 }
 
 export interface AxeScanResult {
@@ -27,16 +39,29 @@ export async function runAxe(page: Page): Promise<AxeScanResult> {
   const url = page.url();
   try {
     const results = await new AxeBuilder({ page }).withTags(TAGS).analyze();
-    const violations: AxeViolation[] = results.violations.map((v) => ({
-      id: v.id,
-      impact: (v.impact as AxeViolation["impact"]) ?? null,
-      help: v.help,
-      helpUrl: v.helpUrl,
-      nodeCount: v.nodes.length,
-      sampleTargets: v.nodes
-        .slice(0, 3)
-        .map((n) => (Array.isArray(n.target) ? n.target.join(" ") : String(n.target))),
-    }));
+    const violations: AxeViolation[] = results.violations.map((v) => {
+      const tp = classifyAxeViolation(
+        v.nodes.map((n) => ({
+          target: n.target,
+          html: n.html,
+        })),
+      );
+      return {
+        id: v.id,
+        impact: (v.impact as AxeViolation["impact"]) ?? null,
+        help: v.help,
+        helpUrl: v.helpUrl,
+        nodeCount: v.nodes.length,
+        sampleTargets: v.nodes
+          .slice(0, 3)
+          .map((n) =>
+            Array.isArray(n.target) ? n.target.join(" ") : String(n.target),
+          ),
+        ...(tp.thirdPartyMajority ? { thirdParty: true } : {}),
+        ...(tp.source ? { thirdPartySource: tp.source } : {}),
+        ...(tp.thirdPartyCount > 0 ? { thirdPartyNodeCount: tp.thirdPartyCount } : {}),
+      };
+    });
     return {
       ranAt,
       url,

@@ -198,6 +198,8 @@ export async function runPersona(opts: RunOptions): Promise<RunResult> {
             axeId: v.id,
             helpUrl: v.helpUrl,
             sampleTargets: v.sampleTargets,
+            ...(v.thirdParty ? { thirdParty: true } : {}),
+            ...(v.thirdPartySource ? { thirdPartySource: v.thirdPartySource } : {}),
           },
         });
       }

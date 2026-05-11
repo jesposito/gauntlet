@@ -172,10 +172,19 @@ export async function buildPersonaReport(
         typeof failure.metadata?.externalHost === "string"
           ? (failure.metadata.externalHost as string)
           : undefined;
+      const isThirdPartyAxe =
+        failure.reason === FailureReason.ACCESSIBILITY_VIOLATION &&
+        failure.metadata?.thirdParty === true;
       // Downgrade console errors that originate from external hosts (CDNs,
       // fonts, etc) to "minor" — they're real signal but they're a noise
       // floor that drowns out actual product findings.
       if (failure.reason === FailureReason.CONSOLE_ERROR && externalHost) {
+        severity = "minor";
+      }
+      // Downgrade axe findings that live entirely inside third-party iframe
+      // content (YouTube, Stripe Elements, etc) — the host site cannot fix
+      // DOM it does not own. Confirmed false-positive class from real dogfood.
+      if (isThirdPartyAxe) {
         severity = "minor";
       }
 
@@ -192,9 +201,15 @@ export async function buildPersonaReport(
         Math.max(0, failure.stepIndex),
       );
       const id = findingId(personaId, flowId, failure.stepIndex, failure.reason, failure.message);
+      const thirdPartySource =
+        typeof failure.metadata?.thirdPartySource === "string"
+          ? (failure.metadata.thirdPartySource as string)
+          : undefined;
+      const thirdPartyTag =
+        isThirdPartyAxe && thirdPartySource ? ` [${thirdPartySource} embed]` : isThirdPartyAxe ? ` [third-party iframe]` : "";
       const title =
         failure.reason === FailureReason.ACCESSIBILITY_VIOLATION
-          ? `${axeId ?? "axe"}: ${failure.message.split(": ").slice(1).join(": ").split(" (")[0]}`
+          ? `${axeId ?? "axe"}: ${failure.message.split(": ").slice(1).join(": ").split(" (")[0]}${thirdPartyTag}`
           : failure.reason === FailureReason.ABANDONED_BY_PERSONA
             ? `Persona abandoned: ${failure.message.split(":").slice(1).join(":").trim().slice(0, 120)}`
             : `${failure.reason}: ${failure.message.slice(0, 80)}`;

@@ -438,6 +438,8 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
               axeId: v.id,
               helpUrl: v.helpUrl,
               sampleTargets: v.sampleTargets,
+              ...(v.thirdParty ? { thirdParty: true } : {}),
+              ...(v.thirdPartySource ? { thirdPartySource: v.thirdPartySource } : {}),
             },
           });
         }
