@@ -16,7 +16,20 @@ const SCHEMA_EXAMPLE = `{
       "audience": "First-time visitors deciding whether to sign up.",
       "features": ["pricing", "demo links", "signup CTA", "feature comparison"],
       "excluded_features": ["account dashboard", "customer-only data"],
+      "requires_auth": false,
+      "login_url": null,
       "notes": "optional"
+    },
+    {
+      "id": "tenant-admin",
+      "name": "Tenant admin panel (the actual product)",
+      "base_url": "https://{tenant}.example.com/admin",
+      "audience": "Customers managing their account / content. THIS is what the product does.",
+      "features": ["edit profile", "manage content", "billing", "settings"],
+      "excluded_features": ["platform marketing copy", "other tenants' data"],
+      "requires_auth": true,
+      "login_url": "https://{tenant}.example.com/login",
+      "notes": "Sits behind auth. gauntlet auth <id> needed before run."
     },
     {
       "id": "customer-portfolio",
@@ -24,7 +37,8 @@ const SCHEMA_EXAMPLE = `{
       "base_url": "https://{tenant}.example.com",
       "audience": "Recruiters / peers / clients reading a specific customer's profile.",
       "features": ["bio", "experience", "blog posts", "contact link"],
-      "excluded_features": ["platform pricing", "signup CTA", "billing UI"]
+      "excluded_features": ["platform pricing", "signup CTA", "billing UI"],
+      "requires_auth": false
     }
   ]
 }`;
@@ -50,6 +64,9 @@ Produce a list of surfaces. Each surface has:
 Rules:
 - 1-6 surfaces total. Don't invent surfaces that aren't supported by the README/landing context.
 - A surface must have a distinct audience from every other surface. If two candidates share audience, merge them.
+- requires_auth=true when: a fetched landing was unreachable with status 401/403, the landing hint mentions "login wall" or "appears to require login", OR the README clearly states the surface is behind auth (admin panel, customer dashboard, internal tooling).
+- login_url is the URL a logged-out user goes to in order to sign in. Set when knowable (often /login on the same host). null otherwise.
+- If the README describes the product as a SaaS/multi-tenant app, you almost certainly have at least one auth-walled surface even when only a marketing page was fetched. Propose it.
 - Output ONLY a JSON object matching the schema below. No prose, no markdown fences.
 
 Example shape:

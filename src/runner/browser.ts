@@ -37,6 +37,7 @@ export interface RunOptions {
   runDir: string;
   maxSteps?: number;
   headless?: boolean;
+  storageStatePath?: string;
 }
 
 export interface RunResult {
@@ -69,6 +70,7 @@ export async function runPersona(opts: RunOptions): Promise<RunResult> {
     isMobile:
       persona.behavior.device === "mobile" || persona.behavior.device === "tablet",
     recordVideo: { dir: join(runDir, "video") },
+    ...(opts.storageStatePath ? { storageState: opts.storageStatePath } : {}),
   });
 
   const netProfile = NETWORK_PROFILES[persona.behavior.network];

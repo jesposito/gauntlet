@@ -47,6 +47,7 @@ export interface FlowRunOptions {
   runDir: string;
   headless?: boolean;
   onEvent?: FlowEventHandler;
+  storageStatePath?: string;
 }
 
 export interface StepResult {
@@ -106,6 +107,7 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
     isMobile:
       persona.behavior.device === "mobile" || persona.behavior.device === "tablet",
     recordVideo: { dir: join(runDir, "video") },
+    ...(opts.storageStatePath ? { storageState: opts.storageStatePath } : {}),
   });
 
   const netProfile = NETWORK_PROFILES[persona.behavior.network];

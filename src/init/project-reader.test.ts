@@ -20,7 +20,7 @@ describe("readProject", () => {
     expect(ctx.keywords).toEqual([]);
     expect(ctx.frameworks).toEqual([]);
     expect(ctx.readmeExcerpt).toBeUndefined();
-    expect(ctx.landing).toBeUndefined();
+    expect(ctx.landings).toEqual([]);
   });
 
   test("reads package.json + detects frameworks", async () => {
@@ -71,7 +71,7 @@ describe("summarizeProject", () => {
       keywords: ["k1"],
       frameworks: ["React"],
       readmeExcerpt: "X",
-      landing: undefined,
+      landings: [],
       totalBytes: 5,
     });
     expect(text).toContain("demo");
@@ -80,6 +80,44 @@ describe("summarizeProject", () => {
     expect(text).toContain("React");
     expect(text).toContain("X");
   });
+  test("renders multiple landings with reachability + hint", () => {
+    const text = summarizeProject({
+      cwd: "/",
+      projectName: "demo",
+      packageDescription: undefined,
+      keywords: [],
+      frameworks: [],
+      readmeExcerpt: undefined,
+      landings: [
+        {
+          url: "https://marketing.example.com",
+          title: "Welcome",
+          metaDescription: undefined,
+          headings: [],
+          navText: [],
+          reachable: true,
+          statusCode: 200,
+        },
+        {
+          url: "https://app.example.com/admin",
+          title: undefined,
+          metaDescription: undefined,
+          headings: [],
+          navText: [],
+          reachable: false,
+          statusCode: 401,
+          hint: "behind authentication (login wall)",
+        },
+      ],
+      totalBytes: 10,
+    });
+    expect(text).toContain("https://marketing.example.com");
+    expect(text).toContain("https://app.example.com/admin");
+    expect(text).toContain("401");
+    expect(text).toContain("behind authentication");
+    expect(text).toContain("Reachable: NO");
+  });
+
   test("handles missing fields", () => {
     const text = summarizeProject({
       cwd: "/",
@@ -88,7 +126,7 @@ describe("summarizeProject", () => {
       keywords: [],
       frameworks: [],
       readmeExcerpt: undefined,
-      landing: undefined,
+      landings: [],
       totalBytes: 0,
     });
     expect(text).toContain("(unknown)");

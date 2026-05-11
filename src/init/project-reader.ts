@@ -12,7 +12,7 @@ export interface ProjectContext {
   keywords: string[];
   frameworks: string[];
   readmeExcerpt: string | undefined;
-  landing: LandingPageContext | undefined;
+  landings: LandingPageContext[];
   totalBytes: number;
 }
 
@@ -22,6 +22,9 @@ export interface LandingPageContext {
   metaDescription: string | undefined;
   headings: string[];
   navText: string[];
+  reachable: boolean;
+  statusCode?: number;
+  hint?: string;
 }
 
 interface PackageJson {
@@ -88,7 +91,7 @@ function extractMatches(html: string, pattern: RegExp, max: number): string[] {
   return out;
 }
 
-async function fetchLanding(url: string): Promise<LandingPageContext | undefined> {
+async function fetchLanding(url: string): Promise<LandingPageContext> {
   try {
     const res = await fetch(url, {
       redirect: "follow",
@@ -97,7 +100,19 @@ async function fetchLanding(url: string): Promise<LandingPageContext | undefined
     });
     if (!res.ok) {
       console.warn(`warn: landing fetch ${url} -> ${res.status}`);
-      return undefined;
+      return {
+        url,
+        title: undefined,
+        metaDescription: undefined,
+        headings: [],
+        navText: [],
+        reachable: false,
+        statusCode: res.status,
+        hint:
+          res.status === 401 || res.status === 403
+            ? "behind authentication (login wall)"
+            : `HTTP ${res.status}`,
+      };
     }
     const raw = await res.text();
     const html = raw.length > MAX_LANDING_BYTES ? raw.slice(0, MAX_LANDING_BYTES) : raw;
@@ -114,22 +129,42 @@ async function fetchLanding(url: string): Promise<LandingPageContext | undefined
       s.slice(0, 300),
     );
 
+    // Hint when the page looks like a login screen even though it returned 200.
+    const lowerHtml = html.toLowerCase();
+    const looksLikeLogin =
+      /<input[^>]+type=["']password["']/i.test(html) ||
+      /\b(sign\s*in|log\s*in)\b/i.test(titleMatch?.[1] ?? "") ||
+      lowerHtml.includes("forgot password");
+    const hint = looksLikeLogin ? "appears to require login" : undefined;
+
     return {
       url,
       title: titleMatch?.[1] ? stripTags(titleMatch[1]) : undefined,
       metaDescription: descMatch?.[1],
       headings,
       navText,
+      reachable: true,
+      statusCode: res.status,
+      ...(hint ? { hint } : {}),
     };
   } catch (err) {
     console.warn(`warn: landing fetch failed: ${(err as Error).message}`);
-    return undefined;
+    return {
+      url,
+      title: undefined,
+      metaDescription: undefined,
+      headings: [],
+      navText: [],
+      reachable: false,
+      hint: (err as Error).message,
+    };
   }
 }
 
 export interface ReadProjectOptions {
   cwd: string;
   url?: string;
+  urls?: string[];
 }
 
 export async function readProject(opts: ReadProjectOptions): Promise<ProjectContext> {
@@ -147,7 +182,13 @@ export async function readProject(opts: ReadProjectOptions): Promise<ProjectCont
     (await readMaybe(join(opts.cwd, "README.md"), MAX_README_BYTES)) ??
     (await readMaybe(join(opts.cwd, "readme.md"), MAX_README_BYTES));
 
-  const landing = opts.url ? await fetchLanding(opts.url) : undefined;
+  const urls = [...(opts.urls ?? []), ...(opts.url ? [opts.url] : [])].filter(
+    (u, i, a) => a.indexOf(u) === i,
+  );
+  const landings: LandingPageContext[] = [];
+  for (const u of urls) {
+    landings.push(await fetchLanding(u));
+  }
 
   const ctx: ProjectContext = {
     cwd: opts.cwd,
@@ -156,19 +197,23 @@ export async function readProject(opts: ReadProjectOptions): Promise<ProjectCont
     keywords: pkg?.keywords ?? [],
     frameworks: detectFrameworks(pkg),
     readmeExcerpt: readme,
-    landing,
+    landings,
     totalBytes: 0,
   };
 
+  const landingsBytes = landings.reduce(
+    (n, l) =>
+      n +
+      (l.title?.length ?? 0) +
+      (l.metaDescription?.length ?? 0) +
+      l.headings.join("").length +
+      l.navText.join("").length,
+    0,
+  );
   ctx.totalBytes =
     (ctx.readmeExcerpt?.length ?? 0) +
     (ctx.packageDescription?.length ?? 0) +
-    (ctx.landing
-      ? (ctx.landing.title?.length ?? 0) +
-        (ctx.landing.metaDescription?.length ?? 0) +
-        ctx.landing.headings.join("").length +
-        ctx.landing.navText.join("").length
-      : 0);
+    landingsBytes;
 
   if (ctx.totalBytes > MAX_TOTAL_BYTES && ctx.readmeExcerpt) {
     const over = ctx.totalBytes - MAX_TOTAL_BYTES;
@@ -188,16 +233,16 @@ export function summarizeProject(ctx: ProjectContext): string {
   if (ctx.packageDescription) parts.push(`Description: ${ctx.packageDescription}`);
   if (ctx.keywords.length > 0) parts.push(`Keywords: ${ctx.keywords.join(", ")}`);
   if (ctx.frameworks.length > 0) parts.push(`Frameworks: ${ctx.frameworks.join(", ")}`);
-  if (ctx.landing) {
-    parts.push("\n## Landing page");
-    parts.push(`URL: ${ctx.landing.url}`);
-    if (ctx.landing.title) parts.push(`Title: ${ctx.landing.title}`);
-    if (ctx.landing.metaDescription)
-      parts.push(`Meta: ${ctx.landing.metaDescription}`);
-    if (ctx.landing.headings.length > 0)
-      parts.push(`Headings:\n- ${ctx.landing.headings.join("\n- ")}`);
-    if (ctx.landing.navText.length > 0)
-      parts.push(`Nav: ${ctx.landing.navText.join(" | ")}`);
+  for (const l of ctx.landings) {
+    parts.push(`\n## Landing page: ${l.url}`);
+    if (l.statusCode) parts.push(`Status: ${l.statusCode}`);
+    if (!l.reachable && l.hint) parts.push(`Reachable: NO - ${l.hint}`);
+    else if (l.hint) parts.push(`Hint: ${l.hint}`);
+    if (l.title) parts.push(`Title: ${l.title}`);
+    if (l.metaDescription) parts.push(`Meta: ${l.metaDescription}`);
+    if (l.headings.length > 0)
+      parts.push(`Headings:\n- ${l.headings.join("\n- ")}`);
+    if (l.navText.length > 0) parts.push(`Nav: ${l.navText.join(" | ")}`);
   }
   if (ctx.readmeExcerpt) {
     parts.push("\n## README excerpt");

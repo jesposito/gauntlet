@@ -26,6 +26,29 @@ export const SurfaceSchema = z.object({
     .describe(
       "Capabilities a user might EXPECT but that don't live here (e.g. tenant portfolios don't show platform pricing).",
     ),
+  requires_auth: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe(
+      "True when this surface sits behind a login wall. Surface generator infers this from landing-page hints (login redirect, 401/403, password input).",
+    ),
+  auth_state: z
+    .string()
+    .nullable()
+    .optional()
+    .transform((v) => v ?? undefined)
+    .describe(
+      "Relative path to a Playwright storageState JSON (cookies + localStorage). Populated by `gauntlet auth <surface>`. Loaded by the runner before navigation.",
+    ),
+  login_url: z
+    .string()
+    .nullable()
+    .optional()
+    .transform((v) => v ?? undefined)
+    .describe(
+      "Where the user goes to sign in. Used by `gauntlet auth` as the default landing URL.",
+    ),
   notes: z.string().optional(),
 });
 

@@ -9,7 +9,8 @@ import {
 import { runPersona } from "./runner/browser.ts";
 import { runFlow, type FlowEvent } from "./runner/flow-runner.ts";
 import { runWithConcurrency } from "./util/pool.ts";
-import { loadAllSurfaces, loadSurface } from "./surface/loader.ts";
+import { loadAllSurfaces, loadSurface, writeSurface } from "./surface/loader.ts";
+import { captureAuth, resolveAuthStatePath } from "./auth/capture.ts";
 import { buildReport, findLatestRunDir } from "./report/build.ts";
 import { DEFAULT_MODEL, pickProvider } from "./ai/index.ts";
 import { configureAiCache } from "./ai/cache.ts";
@@ -185,8 +186,30 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
     personaIds = matched;
   }
 
+  // Cache surfaces we touch so we resolve each yaml once.
+  const surfaceCache = new Map<string, Awaited<ReturnType<typeof loadSurface>>>();
+  async function getSurface(id: string | undefined): Promise<
+    Awaited<ReturnType<typeof loadSurface>> | undefined
+  > {
+    if (!id) return undefined;
+    const hit = surfaceCache.get(id);
+    if (hit) return hit;
+    try {
+      const s = await loadSurface(id, cwd);
+      surfaceCache.set(id, s);
+      return s;
+    } catch {
+      return undefined;
+    }
+  }
+
   // Pre-resolve every persona + its flows, so we can plan concurrency.
-  const plans: { persona: Awaited<ReturnType<typeof loadPersona>>; flows: Awaited<ReturnType<typeof loadFlowsForPersona>> }[] = [];
+  type Plan = {
+    persona: Awaited<ReturnType<typeof loadPersona>>;
+    flows: Awaited<ReturnType<typeof loadFlowsForPersona>>;
+    storageStatePath?: string;
+  };
+  const plans: Plan[] = [];
   let totalDroppedByFilter = 0;
   for (const id of personaIds) {
     if (!id) continue;
@@ -194,6 +217,17 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
     if (surfaceArg && persona.surface && persona.surface !== surfaceArg) {
       console.warn(`warn: persona ${id} has surface="${persona.surface}", skipping under --surface=${surfaceArg}.`);
       continue;
+    }
+    const effectiveSurfaceId = surfaceArg ?? persona.surface;
+    const surface = await getSurface(effectiveSurfaceId);
+    const storageStatePath = surface
+      ? resolveAuthStatePath(cwd, surface.auth_state)
+      : undefined;
+    if (surface?.requires_auth && !storageStatePath) {
+      console.warn(
+        `warn: surface "${surface.id}" requires_auth=true but no auth_state captured. ` +
+          `Persona ${id} will hit the login wall. Run \`gauntlet auth ${surface.id}\` first.`,
+      );
     }
     let flows = forceLegacy ? [] : await loadFlowsForPersona(id, cwd);
     if (!forceLegacy && filterIsActive && flows.length > 0) {
@@ -207,7 +241,7 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
         );
       }
     }
-    plans.push({ persona, flows });
+    plans.push({ persona, flows, ...(storageStatePath ? { storageStatePath } : {}) });
   }
   if (filterIsActive) {
     const totalKept = plans.reduce((n, p) => n + p.flows.length, 0);
@@ -257,13 +291,21 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
   type PersonaResult = { persona: string; flows: number; failures: number; outcomes: string[] };
 
   await runWithConcurrency<typeof plans[number], PersonaResult>(plans, concurrency, async (plan) => {
-    const { persona, flows } = plan;
+    const { persona, flows, storageStatePath } = plan;
+    const authSuffix = storageStatePath ? ` (authed)` : "";
     if (flows.length === 0) {
       const runDir = join(baseDir, persona.id);
       console.log(
-        `[${persona.id}] ${persona.character.name} -> ${url} (no flows; legacy single-step capture)`,
+        `[${persona.id}] ${persona.character.name} -> ${url}${authSuffix} (no flows; legacy single-step capture)`,
       );
-      const result = await runPersona({ url, persona, runDir, maxSteps, headless });
+      const result = await runPersona({
+        url,
+        persona,
+        runDir,
+        maxSteps,
+        headless,
+        ...(storageStatePath ? { storageStatePath } : {}),
+      });
       console.log(
         `[${persona.id}] done. steps=${result.steps} failures=${result.failures.length} duration=${result.durationMs}ms`,
       );
@@ -271,7 +313,7 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
     }
 
     console.log(
-      `[${persona.id}] ${persona.character.name} -> ${url} (${flows.length} flow${flows.length === 1 ? "" : "s"})`,
+      `[${persona.id}] ${persona.character.name} -> ${url}${authSuffix} (${flows.length} flow${flows.length === 1 ? "" : "s"})`,
     );
     let totalFailures = 0;
     const outcomes: string[] = [];
@@ -285,6 +327,7 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
         runDir,
         headless,
         onEvent: logEvent,
+        ...(storageStatePath ? { storageStatePath } : {}),
       });
       totalFailures += result.failures.length;
       outcomes.push(result.outcome);
@@ -326,6 +369,46 @@ async function cmdReport(args: ParsedArgs): Promise<void> {
       console.log(`  ${p.signature.padEnd(50)} ${p.count}x (${p.personas.join(", ")})`);
     }
   }
+}
+
+async function cmdAuth(args: ParsedArgs): Promise<void> {
+  const surfaceId = args.positional[0];
+  if (!surfaceId) {
+    console.error("error: usage: gauntlet auth <surface-id> [--url <login-url>]");
+    process.exit(2);
+  }
+  const cwd = process.cwd();
+  let surface;
+  try {
+    surface = await loadSurface(surfaceId, cwd);
+  } catch (err) {
+    console.error(`error: cannot load surface "${surfaceId}": ${err instanceof Error ? err.message : String(err)}`);
+    console.error(`hint: run \`gauntlet surfaces\` to see what's curated.`);
+    process.exit(2);
+  }
+
+  const explicitUrl = typeof args.flags.url === "string" ? args.flags.url : undefined;
+  const url = explicitUrl ?? surface.login_url ?? surface.base_url;
+  if (!url) {
+    console.error(
+      `error: no URL for auth capture. Surface "${surfaceId}" has no login_url or base_url. Pass --url <login-page>.`,
+    );
+    process.exit(2);
+  }
+
+  console.log(`gauntlet auth -> surface=${surfaceId} url=${url}`);
+  const result = await captureAuth({ cwd, surfaceId, url });
+  console.log(
+    `\ncaptured: cookies=${result.cookieCount} origins=${result.originCount}`,
+  );
+  console.log(`saved:    ${result.relativePath}`);
+
+  surface.auth_state = result.relativePath;
+  if (!surface.requires_auth) surface.requires_auth = true;
+  if (!surface.login_url && explicitUrl) surface.login_url = explicitUrl;
+  const written = await writeSurface(surface, cwd);
+  console.log(`updated:  ${written} (auth_state=${result.relativePath})`);
+  console.log(`\nnext: gauntlet run --surface ${surfaceId} ...`);
 }
 
 async function cmdSurfaces(): Promise<void> {
@@ -377,7 +460,7 @@ async function cmdList(): Promise<void> {
 
 async function cmdInit(args: ParsedArgs): Promise<void> {
   const cwd = process.cwd();
-  const url = typeof args.flags.url === "string" ? args.flags.url : undefined;
+  const urls = splitCsv(args.flags.url);
   const model =
     typeof args.flags.model === "string" ? args.flags.model : DEFAULT_MODEL;
   const requested = args.flags.count ? Number(args.flags.count) : 10;
@@ -387,16 +470,22 @@ async function cmdInit(args: ParsedArgs): Promise<void> {
   console.log(`  cwd:    ${cwd}`);
   console.log(`  model:  ${model}`);
   console.log(`  cache:  ${cacheEnabled ? "on (.gauntlet/cache/ai/)" : "off"}`);
-  if (url) console.log(`  url:    ${url}`);
+  if (urls.length > 0) console.log(`  urls:   ${urls.join(", ")}`);
 
   configureAiCache({ enabled: cacheEnabled, cwd });
   const provider = pickProvider(model);
 
   console.log("\n[Phase A] reading project context...");
-  const project = await readProject({ cwd, ...(url ? { url } : {}) });
+  const project = await readProject({ cwd, urls });
+  const reachable = project.landings.filter((l) => l.reachable).length;
+  const unreachable = project.landings.length - reachable;
   console.log(
-    `  project=${project.projectName ?? "(unknown)"} frameworks=[${project.frameworks.join(", ")}] readme=${project.readmeExcerpt ? "yes" : "no"} landing=${project.landing ? "yes" : "no"} bytes=${project.totalBytes}`,
+    `  project=${project.projectName ?? "(unknown)"} frameworks=[${project.frameworks.join(", ")}] readme=${project.readmeExcerpt ? "yes" : "no"} landings=${reachable}+${unreachable} bytes=${project.totalBytes}`,
   );
+  for (const l of project.landings) {
+    if (!l.reachable) console.log(`    [${l.statusCode ?? "ERR"}] ${l.url} (${l.hint ?? "unreachable"})`);
+    else if (l.hint) console.log(`    [${l.statusCode}] ${l.url} (${l.hint})`);
+  }
 
   const templates = await loadTemplates();
   console.log(`  templates loaded: ${templates.length}`);
@@ -476,7 +565,7 @@ async function cmdFlows(args: ParsedArgs): Promise<void> {
   const provider = pickProvider(model);
 
   console.log("\n[Phase A] reading project context...");
-  const project = await readProject({ cwd, ...(url ? { url } : {}) });
+  const project = await readProject({ cwd, urls: url ? [url] : [] });
   console.log(
     `  project=${project.projectName ?? "(unknown)"} bytes=${project.totalBytes}`,
   );
@@ -524,14 +613,24 @@ usage:
                [--paths <path[,...]>]
   gauntlet report [<run-dir>] [--run <path>] [--no-vet]
   gauntlet surfaces
+  gauntlet auth <surface-id> [--url <login-url>]
   gauntlet list
   gauntlet help
 
 init flags:
-  --url <url>        landing page to fetch for product context (optional)
+  --url <urls>       landing page(s) to fetch for product context. Multiple
+                     accepted: \`--url https://marketing.example.com https://app.example.com/admin\`
+                     or comma-separated. Fetches each and includes in AI prompt.
+                     Pages that 401/403 or look like login walls are flagged so
+                     surface-generator infers requires_auth=true.
   --model <id>       AI model for persona generation (default ${DEFAULT_MODEL})
   --count <n>        candidate count to request from AI (default 10)
   --no-cache         disable AI response cache (default: cache on)
+
+auth flags:
+  --url <url>        login page URL (defaults to surface.login_url or surface.base_url)
+  saves Playwright storageState to .gauntlet/auth/<surface-id>.json
+  updates the surface yaml with auth_state + requires_auth=true
 
 flows flags:
   --personas <ids>   curated persona ids to design flows for (default: all)
@@ -597,6 +696,9 @@ async function main(): Promise<void> {
       break;
     case "surfaces":
       await cmdSurfaces();
+      break;
+    case "auth":
+      await cmdAuth(args);
       break;
     case "list":
       await cmdList();
