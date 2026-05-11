@@ -1,0 +1,30 @@
+id: skeptical-first-timer
+label: core
+description: |
+  First-time visitor evaluating whether this product is trustworthy and
+  relevant within 30 seconds. Reads the headline, scans the hero, looks for
+  pricing, looks for proof (logos, testimonials), looks for a clear next step.
+  Bounces if the value prop is unclear or the page asks for an account before
+  showing value.
+behavior:
+  device: laptop
+  viewport:
+    width: 1440
+    height: 900
+  network: home-wifi
+  input: mouse
+  patience_threshold_seconds: 30
+  reading_level: 9th_grade
+  avoids:
+    - account_creation_walls
+    - vague_marketing_copy
+    - cookie_banner_blocking_hero
+  abandons_on:
+    - value_prop_unclear_after_15_seconds
+    - cannot_find_pricing
+    - cannot_find_signup_or_demo_cta
+  prefers:
+    - specific_concrete_headline
+    - visible_social_proof
+    - obvious_pricing_link
+    - low_commitment_first_step

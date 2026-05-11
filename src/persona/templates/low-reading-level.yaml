@@ -1,0 +1,30 @@
+id: low-reading-level
+label: core
+description: |
+  User reads at a 3rd-to-6th-grade level. May have a learning difference, may
+  be reading in a second language, or may just be tired and skimming. Dense
+  paragraphs, legal language, and indirect button labels ("Continue" instead
+  of "Pay now") cause stalls and wrong choices.
+behavior:
+  device: mobile
+  viewport:
+    width: 390
+    height: 844
+  network: home-wifi
+  input: touch
+  patience_threshold_seconds: 30
+  reading_level: 3rd_grade
+  avoids:
+    - long_paragraphs
+    - legal_jargon
+    - indirect_button_verbs
+    - inline_dense_help_text
+  abandons_on:
+    - cannot_understand_primary_action
+    - error_message_doesnt_explain_what_to_do
+    - required_field_has_no_example
+  prefers:
+    - one_sentence_per_step
+    - verb_first_buttons
+    - inline_examples
+    - clear_error_recovery_instructions

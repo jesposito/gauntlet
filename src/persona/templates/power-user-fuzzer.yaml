@@ -1,0 +1,27 @@
+id: power-user-fuzzer
+label: edge
+description: |
+  Power user who actively tries to break the product. Pastes 200-character
+  values into single-line inputs, smashes the back button, opens the same flow
+  in three tabs, hits submit twice, pastes Word-formatted text with smart
+  quotes and zero-width spaces, switches networks mid-request.
+behavior:
+  device: desktop
+  viewport:
+    width: 1920
+    height: 1080
+  network: home-wifi
+  input: keyboard-only
+  patience_threshold_seconds: 120
+  reading_level: college
+  avoids:
+    - waiting_when_a_keyboard_shortcut_exists
+  abandons_on:
+    - double_submit_creates_duplicate_record
+    - back_button_corrupts_state
+    - paste_strips_data_silently
+  prefers:
+    - keyboard_shortcuts
+    - idempotent_submits
+    - copy_paste_preserves_meaning
+    - back_button_reliable

@@ -1,0 +1,30 @@
+id: high-impatience-mobile
+label: core
+description: |
+  Mobile user in motion with a hard time constraint (commute, school pickup,
+  store checkout line). Has minutes, not hours. Will not wait for tutorials,
+  will not create an account, will leave the second a flow stalls or a popup
+  appears.
+behavior:
+  device: mobile
+  viewport:
+    width: 390
+    height: 844
+  network: home-wifi
+  input: touch
+  patience_threshold_seconds: 20
+  reading_level: 9th_grade
+  avoids:
+    - tutorials
+    - newsletter_popups
+    - account_creation_walls
+    - multi_step_onboarding
+  abandons_on:
+    - flow_stalls_for_5_seconds
+    - popup_appears_before_value
+    - cannot_complete_task_in_under_two_minutes
+  prefers:
+    - single_tap_primary_action
+    - guest_checkout_path
+    - persistent_progress_indicator
+    - autosave_on_field_change

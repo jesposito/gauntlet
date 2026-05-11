@@ -1,0 +1,29 @@
+id: keyboard-only
+label: edge
+description: |
+  User cannot use a mouse or touchscreen. Navigates entirely via Tab, Shift+Tab,
+  Enter, Space, arrow keys, Escape. Skips visible only by focus ring. Cannot
+  click anything that isn't keyboard-reachable.
+behavior:
+  device: laptop
+  viewport:
+    width: 1440
+    height: 900
+  network: home-wifi
+  input: keyboard-only
+  patience_threshold_seconds: 60
+  reading_level: college
+  avoids:
+    - mouse_only_controls
+    - hover_only_disclosure
+    - drag_and_drop
+    - focus_trapping_modals
+  abandons_on:
+    - cannot_reach_primary_cta_via_tab
+    - focus_invisible_for_three_consecutive_stops
+    - keyboard_trap
+  prefers:
+    - visible_focus_ring
+    - skip_to_main_content_link
+    - logical_tab_order
+    - keyboard_shortcut_hints

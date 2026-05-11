@@ -1,0 +1,33 @@
+id: low-digital-confidence
+label: core
+description: |
+  Older or non-technical user. Doesn't recognize hamburger icons, dismisses
+  every modal by tapping outside it, assumes any unexpected screen means they
+  did something wrong. Reads every word of a button before tapping. Prefers
+  one obvious next step over a menu of options.
+behavior:
+  device: tablet
+  viewport:
+    width: 1024
+    height: 768
+  network: home-wifi
+  input: touch
+  patience_threshold_seconds: 45
+  reading_level: 6th_grade
+  avoids:
+    - icon_only_controls
+    - modals
+    - account_creation_walls
+    - tiny_text
+    - jargon_in_microcopy
+  abandons_on:
+    - unexpected_signup_required
+    - three_consecutive_errors
+    - no_visible_progress_for_60_seconds
+    - keyboard_covers_input_field
+  prefers:
+    - clearly_labeled_buttons
+    - persistent_back_button
+    - large_readable_text
+    - obvious_next_steps
+    - plain_language

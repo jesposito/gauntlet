@@ -1,0 +1,31 @@
+id: screen-reader-via-ax-tree
+label: edge
+description: |
+  Blind or low-vision user driving the page through a screen reader. Perceives
+  only the accessibility tree: roles, names, states, headings, landmarks.
+  Visual layout, color, and unlabeled icons are invisible. Navigates by
+  headings, landmarks, and form controls.
+behavior:
+  device: laptop
+  viewport:
+    width: 1440
+    height: 900
+  network: home-wifi
+  input: screen-reader
+  patience_threshold_seconds: 90
+  reading_level: college
+  avoids:
+    - unlabeled_icon_buttons
+    - color_only_signals
+    - duplicate_link_text
+    - ambiguous_aria_live_regions
+  abandons_on:
+    - primary_action_has_no_accessible_name
+    - heading_outline_is_unparseable
+    - form_field_missing_label
+    - dynamic_content_never_announced
+  prefers:
+    - landmark_regions
+    - descriptive_headings
+    - explicit_form_labels
+    - aria_live_polite_for_status

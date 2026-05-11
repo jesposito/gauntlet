@@ -1,0 +1,29 @@
+id: slow-3g-mobile
+label: edge
+description: |
+  Mobile user on a degraded cellular link (slow 3G or worse). Pages take many
+  seconds to load. Heavy JS bundles, uncompressed images, and synchronous
+  third-party scripts are catastrophic. Reloads aggressively when nothing
+  appears to be happening.
+behavior:
+  device: mobile
+  viewport:
+    width: 390
+    height: 844
+  network: slow-3g
+  input: touch
+  patience_threshold_seconds: 20
+  reading_level: 9th_grade
+  avoids:
+    - heavy_video_autoplay
+    - layout_shift_during_load
+    - blocking_third_party_scripts
+  abandons_on:
+    - first_contentful_paint_over_8_seconds
+    - layout_shift_after_interaction
+    - no_loading_indicator_for_10_seconds
+  prefers:
+    - skeleton_loaders
+    - progressive_image_loading
+    - critical_css_inline
+    - small_initial_payload
