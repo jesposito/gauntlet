@@ -8,6 +8,19 @@ The format roughly follows [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Changed
 
+- **Third-party iframe axe findings auto-tagged + downgraded.** Real-world
+  dogfood (facets-sh PR #481) confirmed 8 axe findings (button-name +
+  aria-prohibited-attr) lived entirely inside the YouTube embed — host
+  site can't fix DOM it doesn't own, but those findings drowned out
+  the 10 fixable findings in the same run. New `src/runner/third-party-
+  axe.ts` detects via frame-pierced target chains (axe `target.length
+  >= 2`) and a known-embed class/id prefix allowlist (youtube, vimeo,
+  stripe-elements, cloudflare-turnstile, recaptcha, hcaptcha, calendly,
+  intercom, typeform). Tagged violations propagate as
+  `metadata.thirdParty` + `thirdPartySource` through the failure event;
+  generator downgrades to severity=minor and appends e.g. `[youtube
+  embed]` to the finding title. Closes `gauntlet-2fq`.
+
 - **Step-judge now requires observable evidence for `give_up`.** Previous
   prompt let the AI bail for aesthetic reasons because the persona's
   voice / personality was framed as "judge as the persona would". Now
