@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "gauntlet",
+  "project_id": "654d486e-46fe-4e65-af60-0a6f0b91c2cd"
+}
