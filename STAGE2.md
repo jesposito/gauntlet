@@ -2,21 +2,33 @@
 
 Stage 1 (commit `ccfe9df`) shipped the scaffold: persona schema, Mary as worked example, Playwright runner with full per-step capture, CLI, smoke test against example.com.
 
-## Big reframe for Stage 2
+## Big reframe (post-Stage-1, from Jed)
 
-**Personas are NOT a fixed library.** They're generated per-project. The tool reads your project and proposes personas tailored to *your* product. You curate. Repeat until critical mass.
+The full product flow is a **gated, collaborative pipeline**, not "one command let-it-rip":
 
-Mary stays in the repo as a worked example of what a `low-digital-confidence-on-tablet` template looks like once instantiated against a recipe site. She is documentation, not a default. Each project produces its own roster.
+- **Phase A** — tool reads codebase + README + landing page → ProductModel
+- **Phase B** — AI proposes core personas + edge personas → dev curates (accept/reject/edit/regen)
+- **Phase C** — AI proposes flows per persona ("what would THIS persona try here?") → dev curates again
+- **Phase D** — execution: gated, isolated browser per persona, careful action loop
+- **Phase E** — individual reports per persona × flow
+- **Phase F** — cross-persona rollup + **vetting layer** that re-checks every finding against artifacts before it ships
 
-## Stage 2 scope
+The vetting layer is the credibility line: findings without artifacts, or whose replay script doesn't re-hit the bug, get dropped or flagged subjective. This is what prevents the product from collapsing into "AI complains, devs ignore."
+
+**Mary** is now documentation only — a worked example of what `low-digital-confidence-on-tablet` looks like when instantiated against a recipe site. Each project generates its own roster.
+
+## Stage 2 covers Phases A + B only
+
+(Phases C, D, E, F land in later stages — see plan file.)
+
+## Stage 2 scope (Phases A + B)
 
 1. **`gauntlet init` command** (`src/cli.ts` + `src/init/`)
-   - Reads project context: `README.md`, `package.json` deps, top-level routes if framework detected, optional `--url <url>` to fetch and analyze the landing page
-   - AI fans out: "based on what this product does, who are the realistic target users?"
-   - Proposes 8-12 candidate personas
-   - Interactive CLI: accept / reject / edit / regenerate / write-my-own
-   - Accepted personas written to `.gauntlet/personas/<id>.yaml`
-   - Re-runnable: subsequent `init` augments rather than replaces
+   - **Phase A:** Read project context — `README.md`, `package.json` description/keywords/deps, top-level routes if framework detected, optional `--url <url>` to fetch landing page (`<title>`, meta description, h1/h2, primary nav text). Bounded to ~30KB total into the AI context. Output: `ProjectContext` object.
+   - **Phase B:** AI proposes a mix of **core personas** (realistic target users for this product) and **edge personas** (low-frequency users who break interesting assumptions — e.g., 200-char input, RTL language, prefers-reduced-motion, back-button-spammer, Word-formatted paste). Aim for 8-12 candidates total with edge personas explicitly labeled.
+   - Interactive CLI curation: `accept` / `reject` / `edit` (open YAML in `$EDITOR`) / `regenerate this slot` / `write-my-own`.
+   - Accepted personas written to `.gauntlet/personas/<id>.yaml`.
+   - Re-runnable: subsequent `init` augments rather than replaces.
 
 2. **Stress-test template library** (`src/persona/templates/*.yaml`)
    - 6-8 universal behavior skeletons (no character details, just behavior + constraints):
@@ -65,4 +77,4 @@ gauntlet run http://localhost:3000  # uses curated roster
 
 ## Continuation prompt (paste into next session)
 
-> Continue Gauntlet Stage 2. Read `STAGE2.md` in the repo for scope. Plan at `~/.claude/plans/now-that-i-m-using-tingly-karp.md`. Repo at `/home/jed/dev/gauntlet/`. Caveman mode on. Critical reframe from Jed: personas are project-generated, not a fixed library — Mary stays as a worked example only.
+> Continue Gauntlet Stage 2 (Phases A + B). Read `STAGE2.md` in the repo for scope. Full pipeline plan at `~/.claude/plans/now-that-i-m-using-tingly-karp.md`. Repo at `/home/jed/dev/gauntlet/`. Caveman mode on. Key constraints: gated/collaborative (dev curates at every transition), personas project-generated (core + edge), Mary is documentation only, vetting layer comes in Stage 5.
