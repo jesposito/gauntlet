@@ -319,18 +319,46 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
     const outcomes: string[] = [];
     for (const flow of flows) {
       const runDir = join(baseDir, persona.id, flow.id);
-      const result = await runFlow({
-        url,
-        persona,
-        flow,
-        provider: getProvider(),
-        runDir,
-        headless,
-        onEvent: logEvent,
-        ...(storageStatePath ? { storageStatePath } : {}),
-      });
-      totalFailures += result.failures.length;
-      outcomes.push(result.outcome);
+      try {
+        const result = await runFlow({
+          url,
+          persona,
+          flow,
+          provider: getProvider(),
+          runDir,
+          headless,
+          onEvent: logEvent,
+          ...(storageStatePath ? { storageStatePath } : {}),
+        });
+        totalFailures += result.failures.length;
+        outcomes.push(result.outcome);
+      } catch (err) {
+        // A single flow crashing must not abort the whole run. Mark it
+        // as outcome=error, surface the message, continue with the next flow.
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[${persona.id}/${flow.id}] flow crashed: ${msg.split("\n")[0]}`);
+        outcomes.push("error");
+        await mkdir(runDir, { recursive: true });
+        await Bun.write(
+          join(runDir, "flow-result.json"),
+          JSON.stringify(
+            {
+              persona: persona.id,
+              flow: flow.id,
+              url,
+              outcome: "error",
+              outcomeReason: `flow runner threw: ${msg}`,
+              steps: [],
+              failures: [],
+              startedAt: Date.now(),
+              finishedAt: Date.now(),
+              durationMs: 0,
+            },
+            null,
+            2,
+          ),
+        );
+      }
     }
     return { persona: persona.id, flows: flows.length, failures: totalFailures, outcomes };
   });

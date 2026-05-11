@@ -18,6 +18,25 @@ import { matchAxeViolationsToPersonaRules } from "./axe-scan.ts";
 import { act, observe } from "../agent/actions.ts";
 import { judgeStep, type StepVerdict } from "./step-judge.ts";
 
+const STEP_OP_TIMEOUT_MS = 60_000;
+
+class StepTimeoutError extends Error {
+  constructor(label: string, ms: number) {
+    super(`${label} timed out after ${ms}ms`);
+    this.name = "StepTimeoutError";
+  }
+}
+
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, rej) => {
+    timer = setTimeout(() => rej(new StepTimeoutError(label, ms)), ms);
+  });
+  return Promise.race([p, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  }) as Promise<T>;
+}
+
 const DEVICE_USER_AGENTS: Record<string, string> = {
   desktop:
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36",
@@ -66,7 +85,7 @@ export interface FlowRunResult {
   runDir: string;
   steps: StepResult[];
   failures: FailureEvent[];
-  outcome: "completed" | "abandoned" | "patience_exceeded" | "error";
+  outcome: "completed" | "abandoned" | "patience_exceeded" | "timeout" | "error";
   outcomeReason: string | undefined;
   durationMs: number;
 }
@@ -240,8 +259,13 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
         ...(persona.character.voice ? { personaVoice: persona.character.voice } : {}),
       };
 
+      try {
       if (step.observation_target) {
-        const obs = await observe(actionCtx, step.observation_target);
+        const obs = await withTimeout(
+          observe(actionCtx, step.observation_target),
+          STEP_OP_TIMEOUT_MS,
+          "observe",
+        );
         emit({ type: "step_observe", personaId: persona.id, flowId: flow.id, stepIndex: i, matched: !!obs.match, reasoning: obs.reasoning });
         if (!obs.match) {
           const verdict: StepVerdict = {
@@ -249,7 +273,11 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
             give_up_reason: `expected to see ${step.observation_target}, but it isn't on the page`,
             evidence: obs.reasoning,
           };
-          const capture = await captureStep(page, cdp, captureCtx, i);
+          const capture = await withTimeout(
+            captureStep(page, cdp, captureCtx, i),
+            STEP_OP_TIMEOUT_MS,
+            "captureStep(observe-give_up)",
+          );
           stepResults.push({
             stepIndex: i,
             intent: step.intent,
@@ -273,7 +301,11 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
         }
       }
 
-      const actionResult = await act(actionCtx, step.intent);
+      const actionResult = await withTimeout(
+        act(actionCtx, step.intent),
+        STEP_OP_TIMEOUT_MS,
+        "act",
+      );
       emit({
         type: "step_act",
         personaId: persona.id,
@@ -290,7 +322,11 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
         // not a failure — many SPAs never idle
       }
 
-      const capture = await captureStep(page, cdp, captureCtx, i);
+      const capture = await withTimeout(
+        captureStep(page, cdp, captureCtx, i),
+        STEP_OP_TIMEOUT_MS,
+        "captureStep",
+      );
 
       // Axe-derived failures (same logic as legacy runner).
       for (const v of capture.axe.violations) {
@@ -328,19 +364,23 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
         });
       }
 
-      const verdict = await judgeStep({
-        provider,
-        page,
-        step,
-        stepIndex: i,
-        totalSteps: flow.steps.length,
-        ...(persona.character.voice ? { personaVoice: persona.character.voice } : {}),
-        actionResult: {
-          performed: actionResult.performed,
-          ...(actionResult.action !== undefined ? { action: actionResult.action } : {}),
-          ...(actionResult.error !== undefined ? { error: actionResult.error } : {}),
-        },
-      });
+      const verdict = await withTimeout(
+        judgeStep({
+          provider,
+          page,
+          step,
+          stepIndex: i,
+          totalSteps: flow.steps.length,
+          ...(persona.character.voice ? { personaVoice: persona.character.voice } : {}),
+          actionResult: {
+            performed: actionResult.performed,
+            ...(actionResult.action !== undefined ? { action: actionResult.action } : {}),
+            ...(actionResult.error !== undefined ? { error: actionResult.error } : {}),
+          },
+        }),
+        STEP_OP_TIMEOUT_MS,
+        "judgeStep",
+      );
 
       stepResults.push({
         stepIndex: i,
@@ -372,6 +412,22 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
         outcomeReason = verdict.give_up_reason ?? "give_up";
         break;
       }
+      } catch (err) {
+        if (err instanceof StepTimeoutError) {
+          failures.push({
+            reason: FailureReason.NAVIGATION_TIMEOUT,
+            message: `step ${i + 1}: ${err.message}`,
+            timestamp: Date.now(),
+            stepIndex: i,
+            url: page.url(),
+          });
+          outcome = "timeout";
+          outcomeReason = err.message;
+          emit({ type: "step_verdict", personaId: persona.id, flowId: flow.id, stepIndex: i, status: "give_up", evidence: err.message });
+          break;
+        }
+        throw err;
+      }
     }
   }
 
@@ -402,8 +458,19 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
     "utf8",
   );
 
-  await context.close();
-  await browser.close();
+  // Close with hard timeouts; if Playwright hangs, force-kill the browser
+  // process rather than blocking the entire run forever.
+  const CLOSE_TIMEOUT_MS = 8_000;
+  try {
+    await withTimeout(context.close(), CLOSE_TIMEOUT_MS, "context.close");
+  } catch {
+    /* ignore — proceed to browser.close which kills the process */
+  }
+  try {
+    await withTimeout(browser.close(), CLOSE_TIMEOUT_MS, "browser.close");
+  } catch {
+    /* ignore — process leak is preferable to hung run */
+  }
 
   const durationMs = Date.now() - startedAt;
   emit({ type: "flow_end", personaId: persona.id, flowId: flow.id, outcome, durationMs });

@@ -26,8 +26,13 @@ const provider = pickProvider("claude-opus-4-7");
 console.log(`dogfood: cwd=${cwd} url=${url} personas=${numPersonas}`);
 
 console.log("\nPhase A: reading project + discovering surfaces...");
-const project = await readProject({ cwd, url });
-console.log(`  ${project.projectName} | bytes=${project.totalBytes} landing=${project.landing ? "yes" : "no"}`);
+const project = await readProject({ cwd, urls: url ? [url] : [] });
+console.log(
+  `  ${project.projectName} | bytes=${project.totalBytes} landings=${project.landings.length}`,
+);
+for (const l of project.landings) {
+  console.log(`    - ${l.url} reachable=${l.reachable}${l.hint ? ` (${l.hint})` : ""}`);
+}
 
 const surfaces = await generateSurfaces({ provider, project });
 console.log(`  ${surfaces.length} surface(s) proposed:`);
