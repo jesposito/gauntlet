@@ -4,6 +4,35 @@ All notable changes to Gauntlet are documented in this file.
 
 The format roughly follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Latest highlights (Unreleased)
+
+Building on the v0.1.0 baseline (the six-phase pipeline + persona library + Playwright runner + vetting layer), this cycle added everything required to take Gauntlet from "scaffold" to "real tool teams can adopt."
+
+**New capabilities:**
+- **Surfaces** — a real product isn't one URL. Marketing / portfolio / admin / ops each get their own audience, features, base URL, and (optionally) auth state.
+- **Auth-walled surfaces** — `gauntlet auth <surface>` captures Playwright `storageState` for one-time login; every subsequent run reuses it. Mode-0600 file permissions throughout.
+- **Flexible targeting** — `--surface`, `--pr`, `--features`, `--tags`, `--exclude-tags`, `--flows`, `--paths` compose with `AND`.
+- **Cross-surface rollup** — `gauntlet cross-report` identifies patterns appearing on 2+ surfaces (almost always design-system tokens to fix once, not three separate bugs).
+- **PR comment** — `gauntlet comment --pr <num>` posts top findings inline via `gh pr comment`. Drop-in GitHub Action lives at [`examples/gauntlet.yml`](examples/gauntlet.yml).
+- **Benchmark harness** — `gauntlet bench` runs Gauntlet against 12 public SaaS sites. Aggregate report per week.
+- **Seed command** — `gauntlet seed` runs init + flows non-interactively. Used by the benchmark + per-project dogfood scripts.
+- **Stage flags** — `--skip-surfaces / --refresh-surfaces / --skip-personas / --surface / --replace-personas` on `init`; `--surface / --replace` on `flows`.
+
+**Reliability + signal-to-noise:**
+- Strict step-judge prompt: `give_up` requires observable evidence, not aesthetic distaste.
+- Per-step `withTimeout` + `AbortSignal` cancellation threaded through every AI provider.
+- Wallclock alarm force-closes the browser if anything wedges past the budget.
+- Confidence-thresholded `observe → act` (Stagehand pattern).
+- Mutation-observer page settle (replaces unreliable `networkidle`).
+- Step memory (last 3 tuples fed back into observe/act prompts).
+- Outer try/finally with bounded close calls; per-flow exception isolation.
+- Auto-detection of third-party iframe content (YouTube, Stripe Elements, Cloudflare Turnstile, reCAPTCHA, hCaptcha, Calendly, Intercom, Typeform, OneTrust, Cookiebot, Osano, TrustArc, Termly, Klaro, CookieYes) + downgrade to minor with embed-source label.
+- 8-bucket console-error classifier (CSP / extension-blocked / preload / mixed-content / cookie-policy / network / uncaught / unknown).
+
+**Verified end-to-end** on Facet Cloud (4 surfaces × 6 personas × 12 flows): first pass produced 49 findings; PR [#481](https://github.com/jesposito/facetcloud/pull/481) closed 10 real bugs; re-running gauntlet post-deploy confirmed the fixed findings dropped out. Detailed write-up in [`README.md`](README.md#what-it-actually-finds).
+
+---
+
 ## Unreleased
 
 ### Added

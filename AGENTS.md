@@ -1,84 +1,113 @@
-# Agent Instructions
+# Contributing & Agent Instructions
 
-This project uses **bd** (beads) for issue tracking. Run `bd prime` for full workflow context.
+This document covers how to work on Gauntlet — for humans and for AI coding agents. The repo's design assumes both will read it.
 
-## Quick Reference
+## Build & test
 
 ```bash
-bd ready              # Find available work
-bd show <id>          # View issue details
-bd update <id> --claim  # Claim work atomically
-bd close <id>         # Complete work
-bd dolt push          # Push beads data to remote
+bun install
+bunx playwright install chromium
+bun run tsc --noEmit       # type check
+bun test                   # 115+ unit tests
 ```
 
-## Non-Interactive Shell Commands
+The test suite is fast (≈ 600 ms). Run it on every change. Type-check passes mean the build passes — no separate build step.
 
-**ALWAYS use non-interactive flags** with file operations to avoid hanging on confirmation prompts.
+## Code conventions
 
-Shell commands like `cp`, `mv`, and `rm` may be aliased to include `-i` (interactive) mode on some systems, causing the agent to hang indefinitely waiting for y/n input.
+- **TypeScript strict mode.** `noUncheckedIndexedAccess` and `exactOptionalPropertyTypes` are on. Be defensive with array indexing; assign `undefined` only when the type allows it.
+- **Zod schemas live in `src/<area>/schema.ts`.** Add `.describe()` strings — they get included in AI prompts via `ProposeOptions.schemaDescription`.
+- **Every pure module has a `.test.ts` next to it.** Most regressions in this codebase were classifier-regex or signature-stability changes under refactor. Tests defend those cheaply.
+- **No `any` without justification.** If you need it, comment why.
+- **Naming truth.** A function that returns `string | undefined` doesn't `getX(): string`. A flag named `--no-cache` actually disables caching — not just "writes a flag somewhere".
+- **One reason to change per file.** When a file grows past ~500 lines or 25 exports, consider splitting. (Soft ceiling, not a rule.)
+- **No emojis in code or commits.** Voice is direct technical English; emojis are fine in user-facing UI strings only (e.g. PR comment severity badges).
 
-**Use these forms instead:**
-```bash
-# Force overwrite without prompting
-cp -f source dest           # NOT: cp source dest
-mv -f source dest           # NOT: mv source dest
-rm -f file                  # NOT: rm file
+## Commit style
 
-# For recursive operations
-rm -rf directory            # NOT: rm -r directory
-cp -rf source dest          # NOT: cp -r source dest
+Conventional Commits. Subject ≤ 72 chars, body explains the **why**:
+
+```
+feat(runner): wait for networkidle after goto so first observe sees the SPA
+
+SPAs (SvelteKit / React / etc) render a near-empty shell at
+DOMContentLoaded and only hydrate after JS executes. Without an explicit
+wait, the first observe() inside the flow loop captures only the "Skip
+to main content" stub.
+
+Adds an 8s networkidle wait between goto and the first step. Caught: on
+the Facet Cloud tenant-admin surface, the busy-creator persona went from
+"abandoned at step 1 (no nav visible)" to actually reaching the project
+edit page.
 ```
 
-**Other commands that may prompt:**
-- `scp` - use `-o BatchMode=yes` for non-interactive
-- `ssh` - use `-o BatchMode=yes` to fail instead of prompting
-- `apt-get` - use `-y` flag
-- `brew` - use `HOMEBREW_NO_AUTO_UPDATE=1` env var
+Reference beads IDs in commit messages when applicable: `Closes gauntlet-3w2`. The auto-tag workflow + beads sync pick these up.
 
-<!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
-## Beads Issue Tracker
+## Pull requests
 
-This project uses **bd (beads)** for issue tracking. Run `bd prime` to see full workflow context and commands.
+- PR title matches the conventional-commit subject of the squashed commit.
+- PR body should reference any bead IDs and call out user-visible changes.
+- All checks must be green before merge.
+- For runner / report / scoring changes, include a before/after example from a dogfood run when possible. Concrete numbers travel.
 
-### Quick Reference
+## Issue tracking (beads)
+
+This project uses [beads](https://github.com/beads-tracker/beads) for issue management. Beads syncs to Dolt, so issue history is queryable + branchable like data.
+
+### Quick reference
 
 ```bash
-bd ready              # Find available work
-bd show <id>          # View issue details
-bd update <id> --claim  # Claim work
-bd close <id>         # Complete work
+bd ready                  # Find work with no blockers
+bd show <id>              # Issue details
+bd update <id> --claim    # Atomically claim work
+bd close <id>             # Complete + record reason
+bd dolt push              # Sync beads data to remote
 ```
 
 ### Rules
 
-- Use `bd` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
-- Run `bd prime` for detailed command reference and session close protocol
-- Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
+- Use `bd` for all task tracking. Do not use TodoWrite, TaskCreate, or markdown TODO lists.
+- Run `bd prime` for the full command reference + session-close protocol.
+- Use `bd remember` for persistent project knowledge. Do not create `MEMORY.md` files.
 
-## Session Completion
+## Session completion checklist
 
-**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
+Work is not complete until pushed to remote. Before ending a session:
 
-**MANDATORY WORKFLOW:**
-
-1. **File issues for remaining work** - Create issues for anything that needs follow-up
-2. **Run quality gates** (if code changed) - Tests, linters, builds
-3. **Update issue status** - Close finished work, update in-progress items
-4. **PUSH TO REMOTE** - This is MANDATORY:
+1. **File issues for remaining work** with `bd create`.
+2. **Run quality gates**: `bun run tsc --noEmit && bun test`.
+3. **Close finished beads** with `bd close <id> --reason "..."`.
+4. **Push everything**:
    ```bash
    git pull --rebase
    bd dolt push
    git push
-   git status  # MUST show "up to date with origin"
+   git status   # must show "up to date with origin"
    ```
-5. **Clean up** - Clear stashes, prune remote branches
-6. **Verify** - All changes committed AND pushed
-7. **Hand off** - Provide context for next session
+5. **Verify** beads + git both pushed.
 
-**CRITICAL RULES:**
-- Work is NOT complete until `git push` succeeds
-- NEVER stop before pushing - that leaves work stranded locally
-- NEVER say "ready to push when you are" - YOU must push
-- If push fails, resolve and retry until it succeeds
-<!-- END BEADS INTEGRATION -->
+If `git push` fails, fix the root cause and retry. Never end a session with local-only changes.
+
+## Non-interactive shell ops
+
+`cp` / `mv` / `rm` are aliased to interactive mode on some systems and will hang an agent indefinitely. Use the force flags:
+
+```bash
+cp -f  / mv -f  / rm -f
+rm -rf  /  cp -rf
+ssh -o BatchMode=yes
+scp -o BatchMode=yes
+apt-get -y
+```
+
+## Documentation
+
+When changing user-visible behavior, update:
+
+- [`README.md`](README.md) — feature is documented in the right section.
+- [`CHANGELOG.md`](CHANGELOG.md) — Unreleased section gets an entry.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — if you added/moved/renamed a file or changed a phase boundary.
+- [`docs/QUICKSTART.md`](docs/QUICKSTART.md) — only if the change affects the five-minute path.
+- Help text in `src/cli.ts` — flags appear in `gauntlet help`.
+
+A documentation change without code is fine. A code change without documentation is not.
