@@ -180,10 +180,29 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
   let outcome: FlowRunResult["outcome"] = "completed";
   let outcomeReason: string | undefined;
   let startUrl: string = url;
+  /**
+   * Wallclock alarm: if the flow body never returns control (Playwright op
+   * wedged with no AbortSignal support, browser pseudo-hang, etc), this fires
+   * at FLOW_WALLCLOCK_BUDGET_MS and aggressively closes the browser. Closing
+   * a Playwright browser causes all in-flight ops to reject, which
+   * propagates up to the loop catch and exits cleanly. Repro path that
+   * required this: get-facet.com scroll_to + a subsequent captureStep
+   * combination that didn't honor any of our inner timeouts (gauntlet-l5a).
+   */
+  let wallclockAlarm: ReturnType<typeof setTimeout> | undefined;
+  let wallclockFired = false;
 
   try {
 
   browser = await chromium.launch({ headless });
+  wallclockAlarm = setTimeout(() => {
+    wallclockFired = true;
+    // Best-effort force-close. Even if these reject, the in-flight ops
+    // they were holding open will reject too, which unblocks the awaits
+    // inside the step loop. No await — we don't want this setTimeout
+    // callback itself blocked on close.
+    browser?.close().catch(() => undefined);
+  }, FLOW_WALLCLOCK_BUDGET_MS);
   const ua = DEVICE_USER_AGENTS[persona.behavior.device] ?? DEVICE_USER_AGENTS.desktop!;
   context = await browser.newContext({
     viewport: persona.behavior.viewport,
@@ -585,6 +604,13 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
   );
 
   } finally {
+    if (wallclockAlarm) clearTimeout(wallclockAlarm);
+    if (wallclockFired && outcome === "completed") {
+      // Wallclock alarm fired but the body didn't see it through outcome.
+      // Mark the flow accordingly so the report reflects what happened.
+      outcome = "timeout";
+      outcomeReason = `flow wallclock alarm fired at ${FLOW_WALLCLOCK_BUDGET_MS / 1000}s — browser force-closed`;
+    }
     // Close with hard timeouts; if Playwright hangs, force-kill the browser
     // process rather than blocking the entire run forever. Wrapped in
     // finally so non-timeout exceptions (provider crash, disk full, etc)

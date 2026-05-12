@@ -6,6 +6,34 @@ The format roughly follows [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ## Unreleased
 
+### Added
+
+- **Stage-isolation flags on `gauntlet init`.** `--skip-surfaces` reuses
+  existing curated surfaces; `--refresh-surfaces` regenerates even when
+  curated; `--skip-personas` exits after surfaces; `--surface <id>`
+  narrows persona generation to one surface (for under-served audiences);
+  `--replace-personas` drops existing personas before regen (scoped by
+  `--surface` when set, otherwise all). Default still runs both phases
+  and augments — no behavior change for existing users.
+- **`gauntlet flows --replace`** drops existing flows for the selected
+  personas before regeneration, so the curated set isn't appended-to
+  forever. **`gauntlet flows --surface <id>`** narrows generation to
+  personas whose surface = id.
+
+### Fixed
+
+- **Flow-level wallclock alarm closes a wedged browser.** `runFlow` now
+  installs a `setTimeout(force-close-browser, FLOW_WALLCLOCK_BUDGET_MS)`
+  immediately after browser launch. If anything inside the flow body
+  hangs past 5 minutes (Playwright op without AbortSignal support is
+  the typical culprit — `scrollIntoViewIfNeeded` retry loops in
+  particular), the alarm fires, closes the browser non-blockingly,
+  which causes every in-flight Playwright await to reject. The outer
+  try/catch handles the cascade; the finally block clears the alarm
+  and runs normal close-with-timeout cleanup. Flow ends `outcome=timeout`
+  with a clear reason. Closes `gauntlet-l5a` — verified against the
+  marketing-surface wedge that prompted this fix.
+
 ### Changed
 
 - **Confidence-thresholded observe → act** (PRIOR-ART Pattern A from

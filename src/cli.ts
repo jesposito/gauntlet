@@ -768,6 +768,19 @@ async function cmdInit(args: ParsedArgs): Promise<void> {
   const requested = args.flags.count ? Number(args.flags.count) : 10;
   const cacheEnabled = args.flags["no-cache"] !== true;
   const probeEnabled = args.flags["no-probe"] !== true && urls.length > 0;
+  // Stage isolation flags. Default: run both phases.
+  const skipSurfaces = args.flags["skip-surfaces"] === true;
+  const skipPersonas = args.flags["skip-personas"] === true;
+  const refreshSurfaces = args.flags["refresh-surfaces"] === true;
+  const replacePersonas = args.flags["replace-personas"] === true;
+  // Narrow persona generation to one surface (when you want more personas
+  // on the under-served surface without touching the others).
+  const onlySurfaceId =
+    typeof args.flags.surface === "string" ? args.flags.surface : undefined;
+  if (skipSurfaces && skipPersonas) {
+    console.error("error: --skip-surfaces + --skip-personas leaves nothing to do.");
+    process.exit(2);
+  }
 
   console.log(`gauntlet init`);
   console.log(`  cwd:    ${cwd}`);
@@ -775,6 +788,11 @@ async function cmdInit(args: ParsedArgs): Promise<void> {
   console.log(`  cache:  ${cacheEnabled ? "on (.gauntlet/cache/ai/)" : "off"}`);
   console.log(`  probe:  ${probeEnabled ? "on (/admin, /login, /pricing, ...)" : "off"}`);
   if (urls.length > 0) console.log(`  urls:   ${urls.join(", ")}`);
+  if (skipSurfaces) console.log(`  flag:   --skip-surfaces (reuse curated)`);
+  if (skipPersonas) console.log(`  flag:   --skip-personas`);
+  if (refreshSurfaces) console.log(`  flag:   --refresh-surfaces (regen)`);
+  if (replacePersonas) console.log(`  flag:   --replace-personas (drop curated first)`);
+  if (onlySurfaceId) console.log(`  flag:   --surface ${onlySurfaceId} (narrow persona gen)`);
 
   configureAiCache({ enabled: cacheEnabled, cwd });
   const provider = pickProvider(model);
@@ -794,12 +812,20 @@ async function cmdInit(args: ParsedArgs): Promise<void> {
   const templates = await loadTemplates();
   console.log(`  templates loaded: ${templates.length}`);
 
-  // [Phase A2] Generate surfaces from the landings before personas — personas
-  // need a surface to live on. Skip if the user has already curated surfaces
-  // and didn't pass --refresh-surfaces.
-  const refreshSurfaces = args.flags["refresh-surfaces"] === true;
+  // [Phase A2] Surfaces. Skip when --skip-surfaces; regen when
+  // --refresh-surfaces; otherwise reuse curated.
   let surfaces = await loadAllSurfaces(cwd);
-  if (surfaces.length === 0 || refreshSurfaces) {
+  if (skipSurfaces) {
+    if (surfaces.length === 0) {
+      console.error(
+        "\nerror: --skip-surfaces requires curated surfaces to exist. Run `gauntlet init` (without --skip-surfaces) first, or drop the flag.",
+      );
+      process.exit(2);
+    }
+    console.log(
+      `\n[Phase A2] skipped (--skip-surfaces); reusing ${surfaces.length} curated surface${surfaces.length === 1 ? "" : "s"}.`,
+    );
+  } else if (surfaces.length === 0 || refreshSurfaces) {
     console.log("\n[Phase A2] AI proposing surfaces from landings + README...");
     const proposed = await generateSurfaces({ provider, project });
     console.log(`  ${proposed.length} surface${proposed.length === 1 ? "" : "s"} proposed`);
@@ -815,6 +841,42 @@ async function cmdInit(args: ParsedArgs): Promise<void> {
     );
   }
 
+  if (skipPersonas) {
+    console.log(
+      `\n[Phase B] skipped (--skip-personas). Surfaces are written; rerun without the flag to generate personas.`,
+    );
+    return;
+  }
+
+  // If --surface specified, narrow generation to that surface only.
+  const narrowSurfaces =
+    onlySurfaceId !== undefined
+      ? surfaces.filter((s) => s.id === onlySurfaceId)
+      : surfaces;
+  if (onlySurfaceId !== undefined && narrowSurfaces.length === 0) {
+    console.error(`\nerror: --surface ${onlySurfaceId} matches no curated surface.`);
+    process.exit(2);
+  }
+
+  // --replace-personas: delete existing curated yamls scoped by --surface
+  // when set, otherwise all. Borrows the surface field from disk so we
+  // only drop personas of the targeted surface.
+  if (replacePersonas) {
+    const personasDir = join(cwd, ".gauntlet/personas");
+    let dropped = 0;
+    for (const id of await listCuratedIds(cwd)) {
+      try {
+        const p = await loadPersona(id, cwd);
+        if (onlySurfaceId !== undefined && p.surface !== onlySurfaceId) continue;
+        await Bun.file(join(personasDir, `${id}.yaml`)).delete();
+        dropped += 1;
+      } catch {
+        /* ignore */
+      }
+    }
+    console.log(`  --replace-personas: dropped ${dropped} existing persona yaml${dropped === 1 ? "" : "s"}.`);
+  }
+
   const existingIds = await listCuratedIds(cwd);
   if (existingIds.length > 0) {
     console.log(
@@ -822,14 +884,16 @@ async function cmdInit(args: ParsedArgs): Promise<void> {
     );
   }
 
-  console.log("\n[Phase B] asking AI for candidate personas...");
+  console.log(
+    `\n[Phase B] asking AI for candidate personas${onlySurfaceId ? ` on surface "${onlySurfaceId}"` : ""}...`,
+  );
   const candidates = await generateCandidates({
     provider,
     project,
     templates,
     count: requested,
     existing: existingIds,
-    ...(surfaces.length > 0 ? { surfaces } : {}),
+    ...(narrowSurfaces.length > 0 ? { surfaces: narrowSurfaces } : {}),
   });
   console.log(`  got ${candidates.length} unique candidates.`);
 
@@ -843,7 +907,7 @@ async function cmdInit(args: ParsedArgs): Promise<void> {
         templates,
         count: 1,
         existing: [...existingIds, ...result.accepted.map((p) => p.id)],
-        ...(surfaces.length > 0 ? { surfaces } : {}),
+        ...(narrowSurfaces.length > 0 ? { surfaces: narrowSurfaces } : {}),
       });
       return fresh[0];
     },
@@ -869,6 +933,10 @@ async function cmdFlows(args: ParsedArgs): Promise<void> {
   const url = typeof args.flags.url === "string" ? args.flags.url : undefined;
   const count = args.flags.count ? Number(args.flags.count) : 3;
   const cacheEnabled = args.flags["no-cache"] !== true;
+  const replaceFlag = args.flags.replace === true;
+  // Narrow flows generation to personas on one surface.
+  const onlySurfaceId =
+    typeof args.flags.surface === "string" ? args.flags.surface : undefined;
 
   const personaArg = args.flags.personas;
   let personaIds: string[];
@@ -882,11 +950,50 @@ async function cmdFlows(args: ParsedArgs): Promise<void> {
     personaIds = String(personaArg).split(",").map((s) => s.trim()).filter(Boolean);
   }
 
+  // Surface filter — keep only personas whose surface matches.
+  if (onlySurfaceId !== undefined) {
+    const kept: string[] = [];
+    for (const id of personaIds) {
+      try {
+        const p = await loadPersona(id, cwd);
+        if (p.surface === onlySurfaceId) kept.push(id);
+      } catch {
+        /* skip */
+      }
+    }
+    if (kept.length === 0) {
+      console.error(`error: no personas have surface="${onlySurfaceId}".`);
+      process.exit(2);
+    }
+    personaIds = kept;
+  }
+
   console.log(`gauntlet flows`);
   console.log(`  cwd:      ${cwd}`);
   console.log(`  model:    ${model}`);
   console.log(`  personas: ${personaIds.join(", ")}`);
   console.log(`  cache:    ${cacheEnabled ? "on" : "off"}`);
+  if (replaceFlag) console.log(`  flag:     --replace (drop existing flows first)`);
+  if (onlySurfaceId) console.log(`  flag:     --surface ${onlySurfaceId}`);
+
+  // --replace: drop existing flows for the selected personas before regen,
+  // so the curated set isn't appended-to.
+  if (replaceFlag) {
+    const flowsDirPath = join(cwd, ".gauntlet/flows");
+    let dropped = 0;
+    for (const personaId of personaIds) {
+      const flows = await loadFlowsForPersona(personaId, cwd);
+      for (const f of flows) {
+        try {
+          await Bun.file(join(flowsDirPath, `${f.id}.yaml`)).delete();
+          dropped += 1;
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    console.log(`  --replace: dropped ${dropped} existing flow yaml${dropped === 1 ? "" : "s"}.`);
+  }
 
   configureAiCache({ enabled: cacheEnabled, cwd });
   const provider = pickProvider(model);
@@ -954,8 +1061,11 @@ function cmdHelp(): void {
   console.log(`gauntlet - persona-driven UX failure discovery
 
 usage:
-  gauntlet init [--url <url>] [--model <id>] [--count N]
-  gauntlet flows [--personas <id[,id...]>] [--model <id>] [--count N] [--url <url>]
+  gauntlet init [--url <urls>] [--skip-surfaces | --refresh-surfaces]
+                [--skip-personas] [--surface <id>] [--replace-personas]
+                [--model <id>] [--count N] [--no-cache] [--no-probe]
+  gauntlet flows [--personas <ids>] [--surface <id>] [--replace]
+                 [--model <id>] [--count N] [--url <url>] [--no-cache]
   gauntlet run [<url> | --url <url> | --surface <id> | --pr <num>]
                [--personas <id[,id...]>]
                [--flows <id[,id...]>] [--features <name[,...]>]
@@ -972,20 +1082,31 @@ usage:
   gauntlet list
   gauntlet help
 
-init flags:
-  --url <urls>       landing page(s) to fetch for product context. Multiple
-                     accepted: \`--url https://marketing.example.com https://app.example.com/admin\`
-                     or comma-separated. Fetches each and includes in AI prompt.
-                     Pages that 401/403 or look like login walls are flagged so
-                     surface-generator infers requires_auth=true.
-  --model <id>       AI model for persona generation (default ${DEFAULT_MODEL})
-  --count <n>        candidate count to request from AI (default 10)
-  --no-cache         disable AI response cache (default: cache on)
-  --no-probe         skip auto-probing /admin, /login, /pricing, /dashboard,
-                     etc. on each --url origin (probe is on by default; 404s
-                     are dropped silently, 200/401/403 are fed to the surface
-                     AI so it can propose admin/internal surfaces you didn't
-                     pass explicitly)
+init flags (target):
+  --url <urls>          landing page(s) to fetch for product context. Multiple
+                        accepted: \`--url https://x.com https://x.com/admin\`
+                        or comma-separated. Pages that 401/403 or look like
+                        login walls get flagged so surface-generator infers
+                        requires_auth=true.
+  --no-probe            skip auto-probing /admin, /login, /pricing, /dashboard
+                        on each origin (probe is on by default; 404s dropped,
+                        200/401/403 fed to the surface AI).
+
+init flags (stage isolation):
+  --skip-surfaces       Phase A2 off; reuse existing curated surfaces.
+                        Useful when surfaces are good but you want fresh personas.
+  --refresh-surfaces    Phase A2 on; regen surfaces even if curated.
+                        Useful when surfaces need rework but personas are fine.
+  --skip-personas       Phase B off; only generate surfaces. Exit after Phase A2.
+  --surface <id>        Narrow Phase B to personas on this surface only.
+                        Useful when one surface is under-served.
+  --replace-personas    Delete existing curated personas before Phase B regen
+                        (scoped by --surface when set; otherwise all).
+
+init flags (misc):
+  --model <id>          AI model for persona generation (default ${DEFAULT_MODEL})
+  --count <n>           candidate count to request from AI (default 10)
+  --no-cache            disable AI response cache (default: cache on)
 
 auth flags:
   --url <url>        login page URL (defaults to surface.login_url or surface.base_url)
@@ -993,11 +1114,14 @@ auth flags:
   updates the surface yaml with auth_state + requires_auth=true
 
 flows flags:
-  --personas <ids>   curated persona ids to design flows for (default: all)
-  --model <id>       AI model for flow generation (default ${DEFAULT_MODEL})
-  --count <n>        flows per persona to propose (default 3)
-  --url <url>        landing page to include in product context (optional)
-  --no-cache         disable AI response cache
+  --personas <ids>      curated persona ids to design flows for (default: all)
+  --surface <id>        narrow to personas whose surface = <id>
+  --replace             drop existing flows for the selected personas before
+                        regen (default: append to the curated set)
+  --model <id>          AI model for flow generation (default ${DEFAULT_MODEL})
+  --count <n>           flows per persona to propose (default 3)
+  --url <url>           landing page to include in product context (optional)
+  --no-cache            disable AI response cache
 
 run target (pick one; combinable):
   <url> | --url <url>   point gauntlet at any URL
