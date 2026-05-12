@@ -29,7 +29,7 @@ Building on the v0.1.0 baseline (the six-phase pipeline + persona library + Play
 - Auto-detection of third-party iframe content (YouTube, Stripe Elements, Cloudflare Turnstile, reCAPTCHA, hCaptcha, Calendly, Intercom, Typeform, OneTrust, Cookiebot, Osano, TrustArc, Termly, Klaro, CookieYes) + downgrade to minor with embed-source label.
 - 8-bucket console-error classifier (CSP / extension-blocked / preload / mixed-content / cookie-policy / network / uncaught / unknown).
 
-**Verified end-to-end** on Facet Cloud (4 surfaces × 6 personas × 12 flows): first pass produced 49 findings; PR [#481](https://github.com/jesposito/facetcloud/pull/481) closed 10 real bugs; re-running gauntlet post-deploy confirmed the fixed findings dropped out. Detailed write-up in [`README.md`](README.md#what-it-actually-finds).
+**Verified end-to-end** against a real multi-tenant SaaS (4 surfaces × 6 personas × 12 flows): first pass produced 49 findings; one afternoon of remediation closed 10 real bugs; re-running gauntlet post-deploy confirmed the fixed findings dropped out. Detailed write-up in [`README.md`](README.md#what-it-actually-finds).
 
 ---
 
@@ -108,7 +108,7 @@ Building on the v0.1.0 baseline (the six-phase pipeline + persona library + Play
   suffix `[<source> banner]`. Closes `gauntlet-aua`.
 
 - **Third-party iframe axe findings auto-tagged + downgraded.** Real-world
-  dogfood (facets-sh PR #481) confirmed 8 axe findings (button-name +
+  dogfood against a real multi-tenant SaaS confirmed 8 axe findings (button-name +
   aria-prohibited-attr) lived entirely inside the YouTube embed — host
   site can't fix DOM it doesn't own, but those findings drowned out
   the 10 fixable findings in the same run. New `src/runner/third-party-
@@ -128,7 +128,7 @@ Building on the v0.1.0 baseline (the six-phase pipeline + persona library + Play
   element absent with no nav to it, or a specific give_up_criterion
   observably fired). Persona voice is for narration tone only, not a
   license to abandon. Cuts the dramatized-abandon noise that surfaced
-  during Facet Cloud dogfood.
+  during real-world dogfood.
 - **Flow generator instructs give_up_criteria to be OBSERVABLE blockers**
   ("submit button disabled with no error explanation"), not personality
   grumbles ("the page feels cluttered"). The judge ignores subjective

@@ -35,10 +35,10 @@ DOMContentLoaded and only hydrate after JS executes. Without an explicit
 wait, the first observe() inside the flow loop captures only the "Skip
 to main content" stub.
 
-Adds an 8s networkidle wait between goto and the first step. Caught: on
-the Facet Cloud tenant-admin surface, the busy-creator persona went from
-"abandoned at step 1 (no nav visible)" to actually reaching the project
-edit page.
+Adds an 8s networkidle wait between goto and the first step. Caught
+in real-world dogfood: a busy-creator persona on a customer admin
+surface went from "abandoned at step 1 (no nav visible)" to actually
+reaching the project edit page.
 ```
 
 Reference beads IDs in commit messages when applicable: `Closes gauntlet-3w2`. The auto-tag workflow + beads sync pick these up.

@@ -18,14 +18,14 @@ bun run src/cli.ts report
 
 ## What it actually finds
 
-Gauntlet was run against [Facet Cloud](https://get-facet.com) (a SaaS the author runs) across 4 distinct surfaces. The first pass produced **49 findings**. Working through them in PR [#481](https://github.com/jesposito/facetcloud/pull/481) closed 10 real bugs in a single afternoon:
+To validate the design, Gauntlet was dogfooded against a real multi-tenant creator platform with four distinct surfaces (marketing site, customer portfolios, creator admin panel, and a public demo). The first pass produced **49 findings**. Triaging them and shipping one afternoon's PR closed 10 real bugs:
 
 | Surface | Pre-fix findings | Post-fix findings | What landed |
 |---|---:|---:|---|
-| `get-facet.com` (marketing) | 11 | 5 | CSP `font-src` + `connect-src` widened; landing page color contrast; pricing page color contrast x3 |
-| `jed.facetcloud.io` (tenant portfolio) | 12 | **2** | Google Fonts CSP unblocked (-10 findings) |
-| `jed.facetcloud.io/admin` (creator admin) | 14 | **2** | `AdminSidebar` touch-target size; SetupWizard duplicate landmarks; markdown editor surface gaps logged |
-| `demo.facetcloud.io` | 13 | 5 | `select-name` aria-labelledby fix, CertificationsSection green-600 → green-700 |
+| Marketing landing | 11 | 5 | CSP `font-src` + `connect-src` widened; landing page color contrast; pricing page color contrast x3 |
+| Customer portfolio | 12 | **2** | Google Fonts CSP unblocked (−10 findings) |
+| Creator admin panel | 14 | **2** | Admin sidebar touch-target size; setup-wizard duplicate landmarks; markdown editor surface gaps logged |
+| Demo site | 13 | 5 | `select-name` aria-labelledby fix; certifications-section color-contrast token swap |
 
 8 findings flagged as YouTube-iframe false positives → now auto-downgraded to `[minor]` with title suffix `[youtube embed]` so they no longer compete with real bugs. Verified post-deploy by re-running gauntlet against the production build: the 10 fixed findings dropped out cleanly.
 
@@ -119,18 +119,18 @@ bun run src/cli.ts seed --url https://your-app.com --personas 4 --flows 2
 ## Core concepts
 
 ### Surfaces
-A real product isn't one URL. Facet Cloud has marketing (`get-facet.com`), customer portfolios (`{tenant}.facetcloud.io`), creator admin (`{tenant}.facetcloud.io/admin`), and internal ops (`admin.facetcloud.io`). Each has a different audience, a different feature set, and a different "what counts as broken." Gauntlet models that with **surfaces**:
+A real product isn't one URL. A multi-tenant SaaS typically has a marketing site (`yourapp.com`), customer-facing artifact pages (`{tenant}.yourapp.com`), a customer admin panel (`{tenant}.yourapp.com/admin`), and an internal ops surface (`admin.yourapp.com`). Each has a different audience, a different feature set, and a different "what counts as broken." Gauntlet models that with **surfaces**:
 
 ```yaml
 # .gauntlet/surfaces/tenant-admin.yaml
 id: tenant-admin
 name: Creator admin panel
-base_url: https://jed.facetcloud.io/admin
+base_url: https://acme.yourapp.com/admin
 audience: The paying customer managing their site content and monetization.
 features: [edit profile, author blog posts, build courses, manage projects]
 excluded_features: [other tenants' data, platform marketing copy]
 requires_auth: true
-login_url: https://jed.facetcloud.io/login
+login_url: https://acme.yourapp.com/login
 auth_state: .gauntlet/auth/tenant-admin.json
 ```
 
@@ -330,7 +330,7 @@ Accessibility scanners drown in false positives. Gauntlet treats noise filtering
 - **Console errors classified** into eight buckets: `csp_violation` (with the directive name extracted), `extension_blocked`, `preload_unused`, `mixed_content`, `cookie_policy`, `network_error`, `uncaught_exception`, `unknown`. Report titles read "CSP font-src: Refused to load…" instead of "console_error: Refused to load…".
 - **Persona judge demands observable evidence** for `give_up`. The persona's voice is for narration tone, not a license to abandon for aesthetic reasons.
 
-Verified on the Facet Cloud dogfood: same input, before/after these filters, signal-to-noise went from ~56% to ~95%.
+Verified on the multi-tenant SaaS dogfood: same input, before/after these filters, signal-to-noise went from ~56% to ~95%.
 
 ---
 
