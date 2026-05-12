@@ -20,6 +20,7 @@ import {
 import { FailureReason, type FailureEvent } from "./failure-reasons.ts";
 import { matchAxeViolationsToPersonaRules } from "./axe-scan.ts";
 import { detectExternalHost } from "./external-host.ts";
+import { classifyConsoleMessage } from "./console-class.ts";
 
 const DEVICE_USER_AGENTS: Record<string, string> = {
   desktop:
@@ -102,13 +103,19 @@ export async function runPersona(opts: RunOptions): Promise<RunResult> {
     if (msg.type() === "error") {
       const text = msg.text();
       const externalHost = detectExternalHost(text, page.url());
+      const cls = classifyConsoleMessage(text);
+      const md: Record<string, unknown> = {};
+      if (externalHost) md.externalHost = externalHost;
+      if (cls.class !== "unknown") md.consoleClass = cls.class;
+      if (cls.cspDirective) md.cspDirective = cls.cspDirective;
+      if (cls.label !== "console error") md.consoleLabel = cls.label;
       failures.push({
         reason: FailureReason.CONSOLE_ERROR,
         message: text,
         timestamp: Date.now(),
         stepIndex: -1,
         url: page.url(),
-        ...(externalHost ? { metadata: { externalHost } } : {}),
+        ...(Object.keys(md).length > 0 ? { metadata: md } : {}),
       });
     }
   });

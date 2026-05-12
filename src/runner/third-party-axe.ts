@@ -34,6 +34,17 @@ const THIRD_PARTY_PREFIXES: { name: string; pattern: RegExp }[] = [
   { name: "calendly", pattern: /calendly-/ },
   { name: "intercom", pattern: /intercom-/ },
   { name: "typeform", pattern: /tf-v1-/ },
+  // Cookie-consent banners / CMPs. Same false-positive shape as iframe
+  // embeds (host site can't fix DOM it doesn't author), but injected
+  // directly into the page rather than into an iframe — so frame-pierce
+  // detection misses them. Prefix-match is the primary signal.
+  { name: "onetrust", pattern: /\bonetrust-|\b(ot-sdk|optanon)-/ },
+  { name: "cookiebot", pattern: /\bCybotCookiebot|\bCookieConsent\b/ },
+  { name: "osano", pattern: /\bosano-cm-/ },
+  { name: "trustarc", pattern: /\btruste-/ },
+  { name: "termly", pattern: /\btermly-/ },
+  { name: "klaro", pattern: /\bklaro\b/ },
+  { name: "cookieyes", pattern: /\bcky-/ },
 ];
 
 export interface ThirdPartyVerdict {

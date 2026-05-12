@@ -8,6 +8,25 @@ The format roughly follows [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Changed
 
+- **Console errors now classified.** New `src/runner/console-class.ts`
+  buckets every console error into one of 8 categories with a label and,
+  for CSP violations, the offending directive name. Categories:
+  `csp_violation` (with `cspDirective` extracted), `extension_blocked`,
+  `preload_unused`, `mixed_content`, `cookie_policy`, `network_error`,
+  `uncaught_exception`, `unknown`. Report titles now read "CSP font-src:
+  Refused to load..." instead of "console_error: Refused to load...".
+  Cross-surface signature still works because the message is still in
+  the finding, but human-scannable noise dropped sharply. Closes
+  `gauntlet-vu2`.
+- **Cookie-consent banner findings tagged third-party.** Same false-
+  positive shape as iframe embeds (CMPs inject DOM the host doesn't
+  own, but directly into the page rather than via iframe). 7 CMPs
+  detected by class/id prefix: OneTrust (`onetrust-`, `ot-sdk-`,
+  `optanon-`), Cookiebot (`CybotCookiebotDialog`, `CookieConsent`),
+  Osano (`osano-cm-`), TrustArc (`truste-`), Termly (`termly-`), Klaro
+  (`klaro`), CookieYes (`cky-`). Auto-downgraded to minor + title
+  suffix `[<source> banner]`. Closes `gauntlet-aua`.
+
 - **Third-party iframe axe findings auto-tagged + downgraded.** Real-world
   dogfood (facets-sh PR #481) confirmed 8 axe findings (button-name +
   aria-prohibited-attr) lived entirely inside the YouTube embed — host

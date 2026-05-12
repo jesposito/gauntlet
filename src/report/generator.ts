@@ -207,12 +207,18 @@ export async function buildPersonaReport(
           : undefined;
       const thirdPartyTag =
         isThirdPartyAxe && thirdPartySource ? ` [${thirdPartySource} embed]` : isThirdPartyAxe ? ` [third-party iframe]` : "";
+      const consoleLabel =
+        typeof failure.metadata?.consoleLabel === "string"
+          ? (failure.metadata.consoleLabel as string)
+          : undefined;
       const title =
         failure.reason === FailureReason.ACCESSIBILITY_VIOLATION
           ? `${axeId ?? "axe"}: ${failure.message.split(": ").slice(1).join(": ").split(" (")[0]}${thirdPartyTag}`
           : failure.reason === FailureReason.ABANDONED_BY_PERSONA
             ? `Persona abandoned: ${failure.message.split(":").slice(1).join(":").trim().slice(0, 120)}`
-            : `${failure.reason}: ${failure.message.slice(0, 80)}`;
+            : failure.reason === FailureReason.CONSOLE_ERROR && consoleLabel
+              ? `${consoleLabel}: ${failure.message.slice(0, 80)}`
+              : `${failure.reason}: ${failure.message.slice(0, 80)}`;
 
       findings.push({
         id,

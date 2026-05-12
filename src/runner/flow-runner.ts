@@ -16,6 +16,7 @@ import {
 import { FailureReason, type FailureEvent } from "./failure-reasons.ts";
 import { matchAxeViolationsToPersonaRules } from "./axe-scan.ts";
 import { detectExternalHost } from "./external-host.ts";
+import { classifyConsoleMessage } from "./console-class.ts";
 import { act, observe } from "../agent/actions.ts";
 import { judgeStep, type StepVerdict } from "./step-judge.ts";
 
@@ -234,13 +235,19 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
     if (msg.type() === "error") {
       const text = msg.text();
       const externalHost = detectExternalHost(text, page.url());
+      const cls = classifyConsoleMessage(text);
+      const md: Record<string, unknown> = {};
+      if (externalHost) md.externalHost = externalHost;
+      if (cls.class !== "unknown") md.consoleClass = cls.class;
+      if (cls.cspDirective) md.cspDirective = cls.cspDirective;
+      if (cls.label !== "console error") md.consoleLabel = cls.label;
       failures.push({
         reason: FailureReason.CONSOLE_ERROR,
         message: text,
         timestamp: Date.now(),
         stepIndex: stepResults.length,
         url: page.url(),
-        ...(externalHost ? { metadata: { externalHost } } : {}),
+        ...(Object.keys(md).length > 0 ? { metadata: md } : {}),
       });
     }
   });

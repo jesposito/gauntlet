@@ -40,6 +40,33 @@ describe("classifyAxeNode", () => {
     expect(v.source).toBe("youtube");
   });
 
+  test("OneTrust cookie banner detected by class prefix", () => {
+    const v = classifyAxeNode({
+      target: [".onetrust-pc-dark-filter"],
+      html: "<div id='onetrust-banner-sdk' class='ot-sdk-container'></div>",
+    });
+    expect(v.thirdParty).toBe(true);
+    expect(v.source).toBe("onetrust");
+  });
+
+  test("Cookiebot dialog detected", () => {
+    const v = classifyAxeNode({
+      target: ["#CybotCookiebotDialog"],
+      html: "<div id='CybotCookiebotDialog' class='CookieConsent'></div>",
+    });
+    expect(v.thirdParty).toBe(true);
+    expect(v.source).toBe("cookiebot");
+  });
+
+  test("Osano CMP detected", () => {
+    const v = classifyAxeNode({
+      target: [".osano-cm-window"],
+      html: "<button class='osano-cm-button'></button>",
+    });
+    expect(v.thirdParty).toBe(true);
+    expect(v.source).toBe("osano");
+  });
+
   test("Stripe Elements detected", () => {
     const v = classifyAxeNode({
       html: "<div class='__PrivateStripeElement'></div>",
