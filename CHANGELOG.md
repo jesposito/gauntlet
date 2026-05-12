@@ -8,6 +8,29 @@ The format roughly follows [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Changed
 
+- **Confidence-thresholded observe → act** (PRIOR-ART Pattern A from
+  Stagehand). Both `LocatorPickSchema` and `ActionPickSchema` gain a
+  required `confidence: 0-100` field. The AI is prompted to reason
+  about its certainty explicitly (90+ for unambiguous, 60-89 for
+  reasonable, <60 for guessing). `observe()` and `act()` apply a
+  threshold of 60: below that, the picked element degrades to
+  `no_match` / action declined, with the confidence captured in
+  reasoning. Stops the runner from cascading through act + judge after
+  the AI hedged on a wrong locator.
+- **Mutation-observer page-settle** (PRIOR-ART Pattern C). New
+  `src/runner/page-settle.ts` `waitForDomSettle(page, {quietMs,
+  timeoutMs})` installs a `MutationObserver` on `document.body` and
+  resolves when N ms have passed without a DOM mutation, capped at a
+  hard timeout. Replaces every `page.waitForLoadState("networkidle")`
+  call in the flow runner. SPAs that poll (analytics, telemetry,
+  websockets) no longer hold the wait open indefinitely.
+- **Step memory in observe / act prompts** (PRIOR-ART Pattern D from
+  browser-use). `ActionContext` gains a `recentSteps?: ReadonlyArray`
+  of the last 3 `(intent, action, outcome, evidence)` tuples. flow-
+  runner builds a rolling memo and threads it through every observe /
+  act call. The AI sees what it just tried + how that turned out, so
+  it stops re-picking a target that already failed.
+
 - **Console errors now classified.** New `src/runner/console-class.ts`
   buckets every console error into one of 8 categories with a label and,
   for CSP violations, the offending directive name. Categories:

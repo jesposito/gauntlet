@@ -17,6 +17,7 @@ import { FailureReason, type FailureEvent } from "./failure-reasons.ts";
 import { matchAxeViolationsToPersonaRules } from "./axe-scan.ts";
 import { detectExternalHost } from "./external-host.ts";
 import { classifyConsoleMessage } from "./console-class.ts";
+import { waitForDomSettle } from "./page-settle.ts";
 import { act, observe } from "../agent/actions.ts";
 import { judgeStep, type StepVerdict } from "./step-judge.ts";
 
@@ -304,12 +305,10 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
 
   try {
     await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
-    // SPAs render a near-empty shell at DOMContentLoaded and only hydrate the
-    // real navigation/content after JS runs. Wait briefly for networkidle so
-    // the first observe() sees the actual page, not a skip-link-only stub.
-    await page
-      .waitForLoadState("networkidle", { timeout: 8_000 })
-      .catch(() => undefined);
+    // SPAs render a near-empty shell at DOMContentLoaded and only hydrate
+    // after JS runs. networkidle is unreliable for apps that poll (analytics,
+    // telemetry, websockets) — DOM-mutation settle is more robust.
+    await waitForDomSettle(page, { quietMs: 600, timeoutMs: 8_000 });
   } catch (err) {
     outcome = "error";
     outcomeReason = `navigation failed: ${err instanceof Error ? err.message : String(err)}`;
@@ -357,10 +356,28 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
         break;
       }
 
+      // Build a rolling memo of the last 3 step outcomes. observe / act
+      // see prior intent + action + outcome so they don't repeat a target
+      // that already failed. Pattern D from docs/PRIOR-ART.md.
+      const recentSteps = stepResults.slice(-3).map((s) => {
+        const outcome: "success" | "in_progress" | "give_up" | "no_match" | "failed" =
+          s.verdict.status === "success"
+            ? "success"
+            : s.verdict.status === "in_progress"
+              ? "in_progress"
+              : "give_up";
+        return {
+          intent: s.intent,
+          ...(s.action ? { action: s.action } : {}),
+          outcome,
+          ...(s.verdict.evidence ? { evidence: s.verdict.evidence } : {}),
+        };
+      });
       const actionCtx = {
         provider,
         page,
         ...(persona.character.voice ? { personaVoice: persona.character.voice } : {}),
+        ...(recentSteps.length > 0 ? { recentSteps } : {}),
       };
 
       try {
@@ -421,7 +438,7 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
         ...(actionResult.error !== undefined ? { error: actionResult.error } : {}),
       });
       try {
-        await page.waitForLoadState("networkidle", { timeout: 5000 });
+        await waitForDomSettle(page, { quietMs: 400, timeoutMs: 5_000 });
       } catch {
         // not a failure — many SPAs never idle
       }

@@ -16,6 +16,15 @@ export const LocatorPickSchema = z.object({
       "Index of the chosen element from the outline. Use -1 if nothing matches.",
     ),
   reasoning: z.string().describe("One sentence: why this element matches."),
+  confidence: z
+    .number()
+    .int()
+    .min(0)
+    .max(100)
+    .default(70)
+    .describe(
+      "0-100 confidence the picked element is correct. Be honest: 90+ only for unambiguous matches (exact name + role + clear semantic match). 60-89 when reasonably sure. <60 when guessing — caller will treat as no_match.",
+    ),
 });
 
 export const ActionPickSchema = LocatorPickSchema.extend({
@@ -41,12 +50,51 @@ export interface ActionContext {
    * rather than continuing to mutate the page in the background.
    */
   signal?: AbortSignal;
+  /**
+   * Last 1-3 step memos from the flow. Without history the AI can repeat a
+   * picked-and-failed locator on the very next observe — feeding the recent
+   * tuples breaks that loop and lets the model pick a different element.
+   * Borrowed from browser-use / Stagehand's "memory" pattern.
+   */
+  recentSteps?: ReadonlyArray<{
+    intent: string;
+    action?: string;
+    targetName?: string;
+    outcome: "success" | "in_progress" | "give_up" | "no_match" | "failed";
+    evidence?: string;
+  }>;
 }
 
 export interface ObserveResult {
   match: OutlineElement | undefined;
   reasoning: string;
   outline: OutlineElement[];
+  /**
+   * 0-100 self-reported confidence the picked element is correct. Callers
+   * threshold this (default 60) and treat low-confidence picks the same as
+   * no_match — better to bail honestly than commit to a wrong locator.
+   */
+  confidence: number;
+}
+
+/**
+ * Below this confidence value, observe() reports no match even when the AI
+ * returned a non-negative idx. Tuned to filter out coin-flip guesses without
+ * being so strict that legitimate-but-uncertain picks get dropped.
+ */
+export const OBSERVE_CONFIDENCE_THRESHOLD = 60;
+
+/** Format the recent-step memos for inclusion in observe / act prompts. */
+function recentStepsPreamble(steps: ActionContext["recentSteps"]): string {
+  if (!steps || steps.length === 0) return "";
+  const lines = steps.map((s, i) => {
+    const action = s.action
+      ? `${s.action}${s.targetName ? ` "${s.targetName.slice(0, 40)}"` : ""}`
+      : "(no action)";
+    const evidence = s.evidence ? ` evidence: ${s.evidence.slice(0, 80)}` : "";
+    return `  ${i + 1}. intent="${s.intent.slice(0, 80)}" -> ${action} -> ${s.outcome}.${evidence}`;
+  });
+  return `\n\nRecent step history (don't repeat mistakes from these — if a prior step failed on a target, pick a different one or report idx=-1):\n${lines.join("\n")}`;
 }
 
 function voicePreamble(voice: string | undefined): string {
@@ -68,11 +116,11 @@ export async function observe(
     messages: [
       {
         role: "system",
-        content: `You pick the best-matching page element from a numbered outline. Output ONLY JSON matching {"idx": number, "reasoning": string}. idx is the element index, or -1 if nothing matches.${voicePreamble(ctx.personaVoice)}`,
+        content: `You pick the best-matching page element from a numbered outline. Output ONLY JSON matching {"idx": number, "reasoning": string, "confidence": number}. idx is the element index, or -1 if nothing matches. confidence is 0-100 reflecting how certain you are: 90+ for unambiguous matches (exact name + role + clear semantic match), 60-89 when reasonably sure, <60 when guessing (callers will treat <60 as no_match).${voicePreamble(ctx.personaVoice)}`,
       },
       {
         role: "user",
-        content: `Outline of visible interactive elements on this page:\n${summarizeOutline(outline)}\n\nInstruction: "${instruction}"\n\nReturn the matching idx, or -1 if no element matches.`,
+        content: `Outline of visible interactive elements on this page:\n${summarizeOutline(outline)}\n\nInstruction: "${instruction}"\n\nReturn the matching idx, or -1 if no element matches.${recentStepsPreamble(ctx.recentSteps)}`,
       },
     ],
     schema: LocatorPickSchema,
@@ -81,8 +129,18 @@ export async function observe(
     temperature: 0,
     ...(ctx.signal ? { signal: ctx.signal } : {}),
   });
-  const match = result.idx >= 0 ? outline[result.idx] : undefined;
-  return { match, reasoning: result.reasoning, outline };
+  const confidence = typeof result.confidence === "number" ? result.confidence : 70;
+  // Low-confidence picks are treated as no_match. Better to bail honestly
+  // than commit to a wrong locator + cascade through act/judge.
+  const match =
+    result.idx >= 0 && confidence >= OBSERVE_CONFIDENCE_THRESHOLD
+      ? outline[result.idx]
+      : undefined;
+  const reasoning =
+    result.idx >= 0 && confidence < OBSERVE_CONFIDENCE_THRESHOLD
+      ? `low confidence (${confidence}/100) — treating as no_match. ${result.reasoning}`
+      : result.reasoning;
+  return { match, reasoning, outline, confidence };
 }
 
 function buildLocator(page: Page, el: OutlineElement): Locator {
@@ -119,11 +177,11 @@ export async function act(ctx: ActionContext, instruction: string): Promise<ActR
     messages: [
       {
         role: "system",
-        content: `You are driving a browser for a user. Given their intent and a numbered outline of visible interactive elements, choose ONE element and ONE action. Output ONLY JSON matching {"idx": number, "action": "click"|"fill"|"press"|"select"|"scroll_to"|"hover", "value": string?, "reasoning": string}. Use idx=-1 if nothing on the page matches the intent. For fill/press/select, value is required.${voicePreamble(ctx.personaVoice)}`,
+        content: `You are driving a browser for a user. Given their intent and a numbered outline of visible interactive elements, choose ONE element and ONE action. Output ONLY JSON matching {"idx": number, "action": "click"|"fill"|"press"|"select"|"scroll_to"|"hover", "value": string?, "reasoning": string, "confidence": number}. Use idx=-1 if nothing on the page matches the intent. For fill/press/select, value is required. confidence is 0-100 — only above 60 will the action actually fire; below 60 the caller treats it as no_match. Be honest: 90+ for unambiguous matches, 60-89 when reasonably sure, <60 when guessing.${voicePreamble(ctx.personaVoice)}`,
       },
       {
         role: "user",
-        content: `Outline:\n${summarizeOutline(outline)}\n\nIntent: "${instruction}"\n\nPick one action to take next.`,
+        content: `Outline:\n${summarizeOutline(outline)}\n\nIntent: "${instruction}"\n\nPick one action to take next.${recentStepsPreamble(ctx.recentSteps)}`,
       },
     ],
     schema: ActionPickSchema,
@@ -133,12 +191,24 @@ export async function act(ctx: ActionContext, instruction: string): Promise<ActR
     ...(ctx.signal ? { signal: ctx.signal } : {}),
   });
 
+  const pickConfidence = typeof pick.confidence === "number" ? pick.confidence : 70;
   if (pick.idx < 0 || pick.idx >= outline.length) {
     return {
       performed: false,
       action: undefined,
       target: undefined,
       reasoning: pick.reasoning,
+    };
+  }
+  // Confidence gate: don't fire the action if the AI hedged. Same threshold
+  // as observe() — low-confidence picks degrade to no_match so the judge
+  // can decide give_up cleanly instead of acting on a guess.
+  if (pickConfidence < OBSERVE_CONFIDENCE_THRESHOLD) {
+    return {
+      performed: false,
+      action: undefined,
+      target: undefined,
+      reasoning: `low confidence (${pickConfidence}/100) — declined to act. ${pick.reasoning}`,
     };
   }
   const target = outline[pick.idx]!;
