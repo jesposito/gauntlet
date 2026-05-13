@@ -1,6 +1,54 @@
 import { z } from "zod";
 import { FailureReason } from "../runner/failure-reasons.ts";
 
+/**
+ * Schema for a per-flow result file written by flow-runner.ts /
+ * legacy browser.ts. This mirrors `FlowResultFile` in
+ * report/generator.ts and is the disk-boundary contract for everything
+ * downstream: persona report aggregation, cross-surface rollup, and
+ * vetting all read this shape.
+ *
+ * Validate with `.parse()` at every read site so a stale, partial, or
+ * hand-edited artifact fails loudly instead of producing a silently
+ * wrong report. See report/io.ts for the read helpers.
+ */
+export const FailureEventSchema = z.object({
+  reason: z.nativeEnum(FailureReason),
+  message: z.string(),
+  timestamp: z.number(),
+  stepIndex: z.number(),
+  url: z.string(),
+  metadata: z.record(z.unknown()).optional(),
+});
+export type FailureEventParsed = z.infer<typeof FailureEventSchema>;
+
+export const FlowResultFileSchema = z.object({
+  persona: z.string(),
+  flow: z.string(),
+  url: z.string(),
+  startUrl: z.string().optional(),
+  surface: z.string().optional(),
+  startedAt: z.number(),
+  finishedAt: z.number(),
+  outcome: z.enum(["completed", "abandoned", "patience_exceeded", "timeout", "error"]),
+  outcomeReason: z.string().optional(),
+  steps: z.array(
+    z.object({
+      stepIndex: z.number().int(),
+      intent: z.string(),
+      action: z.string().optional(),
+      performed: z.boolean(),
+      verdict: z.object({
+        status: z.string(),
+        give_up_reason: z.string().optional(),
+        evidence: z.string(),
+      }),
+    }),
+  ),
+  failures: z.array(FailureEventSchema),
+});
+export type FlowResultFile = z.infer<typeof FlowResultFileSchema>;
+
 export const SeveritySchema = z.enum(["critical", "serious", "moderate", "minor"]);
 export type Severity = z.infer<typeof SeveritySchema>;
 

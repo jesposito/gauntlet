@@ -32,21 +32,86 @@ export const GiveUpClassSchema = z.enum([
 
 export type GiveUpClass = z.infer<typeof GiveUpClassSchema>;
 
-export const StepVerdictSchema = z.object({
-  status: z.enum(["success", "in_progress", "give_up"]),
-  give_up_reason: z
-    .string()
-    .optional()
-    .describe(
-      "Which give_up_criteria fired, or which observable signal triggered abandon.",
+/**
+ * Internal canonical verdict shape: discriminated union on `status`. The
+ * give-up variant requires both `give_up_reason` and `give_up_class` so that
+ * downstream reporters never see a give-up without classification — that
+ * invariant used to be patched in via post-parse coercion, which is exactly
+ * the kind of "model the constraint, don't guard around it" anti-pattern
+ * the codex audit flagged.
+ *
+ * The AI sometimes still emits give_up verdicts without a class. We tolerate
+ * that by parsing into a permissive raw schema first, then normalizing into
+ * this strict shape (defaulting missing class -> "bug" so non-classified
+ * abandons keep their original severity and never silently suppress a real
+ * defect).
+ */
+export const StepVerdictSchema = z.discriminatedUnion("status", [
+  z.object({
+    status: z.literal("success"),
+    evidence: z
+      .string()
+      .describe("One sentence: what on the page supports success."),
+  }),
+  z.object({
+    status: z.literal("in_progress"),
+    evidence: z
+      .string()
+      .describe("One sentence: what on the page shows progress."),
+  }),
+  z.object({
+    status: z.literal("give_up"),
+    give_up_reason: z
+      .string()
+      .describe(
+        "Which give_up_criteria fired, or which observable signal triggered abandon.",
+      ),
+    give_up_class: GiveUpClassSchema.describe(
+      "Required for give_up. Distinguishes real defects from confusing UX / feature gaps / persona-expectation noise.",
     ),
-  give_up_class: GiveUpClassSchema.optional().describe(
-    "Required when status='give_up'. Distinguishes real defects from confusing UX / feature gaps / persona-expectation noise.",
-  ),
-  evidence: z.string().describe("One sentence: what on the page supports this verdict."),
-});
+    evidence: z
+      .string()
+      .describe("One sentence: what on the page supports give_up."),
+  }),
+]);
 
 export type StepVerdict = z.infer<typeof StepVerdictSchema>;
+
+/**
+ * Permissive raw shape used to parse AI output before normalizing into the
+ * strict StepVerdictSchema above. Optional fields here account for known
+ * provider sloppiness (omitted give_up_class on give_up verdicts, missing
+ * give_up_reason). Normalization fills the gaps so the rest of the codebase
+ * sees the strict discriminated union.
+ */
+export const RawStepVerdictSchema = z.object({
+  status: z.enum(["success", "in_progress", "give_up"]),
+  give_up_reason: z.string().optional(),
+  give_up_class: GiveUpClassSchema.optional(),
+  evidence: z.string(),
+});
+
+export type RawStepVerdict = z.infer<typeof RawStepVerdictSchema>;
+
+/**
+ * Normalize a permissive AI output into the strict StepVerdict union. For
+ * give_up verdicts, missing give_up_class defaults to "bug" so we never
+ * silently suppress a real defect (real-world dogfood: audplexus 2026-05-13,
+ * 4/4 abandoned flows came back with no give_up_class), and missing
+ * give_up_reason defaults to the evidence text. Exported for tests; runtime
+ * consumers should depend on the strict StepVerdict shape only.
+ */
+export function normalizeVerdict(raw: RawStepVerdict): StepVerdict {
+  if (raw.status === "give_up") {
+    return {
+      status: "give_up",
+      give_up_reason: raw.give_up_reason ?? raw.evidence,
+      give_up_class: raw.give_up_class ?? "bug",
+      evidence: raw.evidence,
+    };
+  }
+  return { status: raw.status, evidence: raw.evidence };
+}
 
 export interface JudgeContext {
   provider: AiProvider;
@@ -61,21 +126,6 @@ export interface JudgeContext {
     error?: string;
   };
   signal?: AbortSignal;
-}
-
-/**
- * Post-parse fix-up: the AI sometimes omits give_up_class even when the prompt
- * says "you MUST set give_up_class". The schema accepts that (optional) so the
- * runner doesn't crash mid-flow, but the auto-downgrade in report rendering
- * can't run without a class. Default missing -> "bug" so non-classified
- * abandons keep their original severity, and a missing class never silently
- * suppresses a real defect.
- */
-export function ensureGiveUpClass(v: StepVerdict): StepVerdict {
-  if (v.status === "give_up" && !v.give_up_class) {
-    return { ...v, give_up_class: "bug" };
-  }
-  return v;
 }
 
 export async function judgeStep(ctx: JudgeContext): Promise<StepVerdict> {
@@ -125,7 +175,7 @@ When status="give_up", you MUST set give_up_class to one of:
 
 Evidence must reference observable state: an outline index, a literal URL, a literal page title, a literal heading text, a snippet from the page-text, or the last-action result. Do not write evidence like "this looks frustrating" — that is not evidence.${voicePreamble}`;
 
-  const verdict = await ctx.provider.propose({
+  const raw = await ctx.provider.propose({
     messages: [
       { role: "system", content: SYSTEM },
       {
@@ -152,11 +202,11 @@ ${pageText || "(no body text captured)"}
 Verdict? Remember: bias toward in_progress; before declaring give_up, check for a <summary> disclosure in the outline AND scan the page-text for synonyms of what the persona wanted; give_up requires an observable blocker, not aesthetic distaste; if status="give_up", set give_up_class.`,
       },
     ],
-    schema: StepVerdictSchema,
+    schema: RawStepVerdictSchema,
     schemaName: "StepVerdict",
     maxTokens: 400,
     temperature: 0,
     ...(ctx.signal ? { signal: ctx.signal } : {}),
   });
-  return ensureGiveUpClass(verdict);
+  return normalizeVerdict(raw);
 }

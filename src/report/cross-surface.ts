@@ -1,10 +1,11 @@
-import { readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { chromium } from "playwright";
 import { runAxe } from "../runner/axe-scan.ts";
 import { loadAllSurfaces, loadSurface } from "../surface/loader.ts";
 import { resolveAuthStatePath } from "../auth/capture.ts";
 import type { RunReport } from "./schema.ts";
+import { readFlowResultOrWarn, readRunReportOrWarn } from "./io.ts";
 import { findLatestRunDir } from "./build.ts";
 
 export interface SurfaceRun {
@@ -140,11 +141,6 @@ export function buildCrossSurface(runs: SurfaceRun[]): CrossSurfaceReport {
   };
 }
 
-interface FlowResultMeta {
-  surface?: string;
-  persona?: string;
-}
-
 async function detectSurfaceForRun(runDir: string, cwd?: string): Promise<string | undefined> {
   // 1. Walk run dir, find any flow-result.json with a surface field.
   // 2. Fallback for pre-surface runs: look at the run's persona dirs, then
@@ -166,13 +162,11 @@ async function detectSurfaceForRun(runDir: string, cwd?: string): Promise<string
       }
       for (const f of flows) {
         const direct = join(personaDir, f, "flow-result.json");
-        try {
-          const raw = await readFile(direct, "utf8");
-          const meta = JSON.parse(raw) as FlowResultMeta;
-          if (meta.surface) return meta.surface;
-        } catch {
-          /* try next */
-        }
+        // Schema-validated read. Bad JSON / wrong shape logs and returns
+        // undefined so we keep walking — matches the prior catch-and-skip
+        // semantics but no longer trusts an `as` cast.
+        const meta = await readFlowResultOrWarn(direct);
+        if (meta?.surface) return meta.surface;
       }
     }
   } catch {
@@ -222,14 +216,12 @@ export async function discoverLatestRunsPerSurface(
     if (!surfaceSet.has(surfaceId)) continue;
     if (claimed.has(surfaceId)) continue;
     const reportPath = join(runDir, "report.json");
-    try {
-      const raw = await readFile(reportPath, "utf8");
-      const report = JSON.parse(raw) as RunReport;
-      result.push({ surfaceId, runDir, report });
-      claimed.add(surfaceId);
-    } catch {
-      // no report.json — skip
-    }
+    // Schema-validated read; missing/corrupt artifacts log and skip so one
+    // bad surface report does not abort the cross-surface rollup.
+    const report = await readRunReportOrWarn(reportPath);
+    if (!report) continue;
+    result.push({ surfaceId, runDir, report });
+    claimed.add(surfaceId);
   }
   return result;
 }
@@ -334,13 +326,9 @@ export async function buildCrossSurfaceReport(
     runs = [];
     for (const runDir of opts.runDirs) {
       const surfaceId = (await detectSurfaceForRun(runDir, opts.cwd)) ?? "(unknown)";
-      try {
-        const raw = await readFile(join(runDir, "report.json"), "utf8");
-        const report = JSON.parse(raw) as RunReport;
-        runs.push({ surfaceId, runDir, report });
-      } catch {
-        // skip
-      }
+      const report = await readRunReportOrWarn(join(runDir, "report.json"));
+      if (!report) continue;
+      runs.push({ surfaceId, runDir, report });
     }
   } else {
     runs = await discoverLatestRunsPerSurface({

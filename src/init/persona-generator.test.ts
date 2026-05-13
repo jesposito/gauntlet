@@ -157,6 +157,23 @@ describe("generateCandidates", () => {
     expect(user).toContain("destinations form and post-error recovery");
   });
 
+  test("regenerate-one (count=1) accepts a single-candidate response without throwing", async () => {
+    // Repro of the bug fixed in #2: the original schema enforced .min(4),
+    // so a correct one-candidate response from the AI was rejected by Zod
+    // and the documented `curate.regenerate` path always failed. This test
+    // proves the regenerate path works end-to-end.
+    const { provider, calls } = makeProvider((_) => [fakeCandidate("only-one")]);
+    const out = await generateCandidates({
+      provider,
+      project: fakeProject(),
+      templates: [],
+      count: 1,
+    });
+    expect(out).toHaveLength(1);
+    expect(out[0]?.id).toBe("only-one");
+    expect(calls).toHaveLength(1);
+  });
+
   test("no focus directive in prompt when focus is unset", async () => {
     const { provider, calls } = makeProvider((_, asked) =>
       Array.from({ length: asked }, (_, i) => fakeCandidate(`p${i}`)),

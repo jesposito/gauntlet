@@ -12,8 +12,18 @@ export const PersonaCandidateSchema = PersonaSchema.extend({
 });
 export type PersonaCandidate = z.infer<typeof PersonaCandidateSchema>;
 
-const CandidateSetSchema = z.object({
+// Initial generation expects a roster: at least 4 candidates so the operator
+// has a meaningful set to curate from.
+const CandidateBatchSchema = z.object({
   candidates: z.array(PersonaCandidateSchema).min(4).max(16),
+});
+
+// Single-slot regeneration (used by `curate` when the operator rejects a
+// candidate and wants a fresh proposal). The model is asked for exactly one
+// candidate and the schema must accept that — using the .min(4) batch schema
+// here was a documented-but-broken path that always tripped Zod.
+const CandidateSingleSchema = z.object({
+  candidates: z.array(PersonaCandidateSchema).min(1).max(16),
 });
 
 const SCHEMA_EXAMPLE = `{
@@ -164,12 +174,17 @@ async function generateOneBatch(
     .filter(Boolean)
     .join("\n\n");
 
+  // Pick the right schema for the ask. Single-slot regeneration (count=1)
+  // legitimately returns 1 candidate; using the batch schema (.min(4)) would
+  // make a correct response fail validation.
+  const schema = targetCount < 4 ? CandidateSingleSchema : CandidateBatchSchema;
+
   const result = await opts.provider.propose({
     messages: [
       { role: "system", content: SYSTEM_PROMPT },
       { role: "user", content: userPrompt },
     ],
-    schema: CandidateSetSchema,
+    schema,
     schemaName: "PersonaCandidateSet",
     schemaDescription:
       "Object with 'candidates' array. Each candidate has id, character{name,age,context,voice}, behavior{...}, label ('core'|'edge'), optional template_id, and rationale.",

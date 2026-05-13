@@ -9,7 +9,11 @@ import {
 import { runPersona } from "./runner/browser.ts";
 import { runFlow, type FlowEvent } from "./runner/flow-runner.ts";
 import { runWithConcurrency } from "./util/pool.ts";
-import { loadAllSurfaces, loadSurface, writeSurface } from "./surface/loader.ts";
+import {
+  loadAllSurfacesWithDiagnostics,
+  loadSurface,
+  writeSurface,
+} from "./surface/loader.ts";
 import { generateSurfaces } from "./init/surface-generator.ts";
 import { captureAuth, resolveAuthStatePath } from "./auth/capture.ts";
 import { buildReport, findLatestRunDir } from "./report/build.ts";
@@ -30,7 +34,16 @@ import {
 import { curate, listCuratedIds } from "./init/curate.ts";
 import { generateFlows } from "./init/flow-generator.ts";
 import { curateFlows } from "./init/curate-flows.ts";
-import { listFlows, loadFlowsForPersona } from "./flow/loader.ts";
+import {
+  listFlows,
+  loadFlowsForPersona,
+  loadFlowsForPersonaWithDiagnostics,
+} from "./flow/loader.ts";
+import {
+  FlagParseError,
+  parseOptionalBoundedIntFlag,
+  parsePositiveIntFlag,
+} from "./cli/flag-parsers.ts";
 import { filterFlows, describeCriteria, type FlowFilterCriteria } from "./flow/filter.ts";
 import { resolvePrUrl } from "./target/pr.ts";
 
@@ -129,14 +142,16 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
       ? String(personaArg).split(",").map((s) => s.trim()).filter((s): s is string => Boolean(s))
       : [];
   const headless = args.flags.headless !== "false" && args.flags.headed !== true;
-  const maxSteps = args.flags.steps ? Number(args.flags.steps) : 1;
+  const maxSteps = parsePositiveIntFlag("steps", args.flags.steps, 1, { max: 50 });
   const cacheEnabled = args.flags["no-cache"] !== true;
   const model =
     typeof args.flags.model === "string" ? args.flags.model : DEFAULT_MODEL;
   const forceLegacy = args.flags["no-flows"] === true;
-  const concurrency = Math.max(
-    1,
-    args.flags.concurrency ? Number(args.flags.concurrency) : 2,
+  const concurrency = parsePositiveIntFlag(
+    "concurrency",
+    args.flags.concurrency,
+    2,
+    { max: 32 },
   );
   const quiet = args.flags.quiet === true;
 
@@ -237,7 +252,22 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
           `Persona ${id} will hit the login wall. Run \`gauntlet auth ${surface.id}\` first.`,
       );
     }
-    let flows = forceLegacy ? [] : await loadFlowsForPersona(id, cwd);
+    let flows: Awaited<ReturnType<typeof loadFlowsForPersona>> = [];
+    if (!forceLegacy) {
+      const loaded = await loadFlowsForPersonaWithDiagnostics(id, cwd);
+      flows = loaded.flows;
+      // Surface broken-flow diagnostics to the operator. If they specifically
+      // targeted a flow id that failed to parse, hard-fail instead of
+      // silently skipping it — that's a bug in their yaml they need to see.
+      for (const d of loaded.diagnostics) {
+        const targetedThisFlow = (filterCriteria.flowIds ?? []).includes(d.flowId);
+        const prefix = targetedThisFlow ? "error" : "warn";
+        console.error(`${prefix}: skipping ${d.path}: ${d.reason}`);
+        if (targetedThisFlow) {
+          process.exit(2);
+        }
+      }
+    }
     if (!forceLegacy && filterIsActive && flows.length > 0) {
       const before = flows.length;
       const { kept, dropped } = filterFlows(flows, filterCriteria);
@@ -485,8 +515,11 @@ async function cmdComment(args: ParsedArgs): Promise<void> {
   }
 
   const prArg = args.flags.pr;
-  const prNumber = typeof prArg === "string" ? Number(prArg) : undefined;
-  const maxFindings = args.flags.max ? Number(args.flags.max) : 5;
+  const prNumber =
+    typeof prArg === "string"
+      ? parsePositiveIntFlag("pr", prArg, 0)
+      : undefined;
+  const maxFindings = parsePositiveIntFlag("max", args.flags.max, 5, { max: 100 });
   const artifactBase = typeof args.flags["artifact-base"] === "string" ? args.flags["artifact-base"] : undefined;
   const runUrl = typeof args.flags["run-url"] === "string" ? args.flags["run-url"] : undefined;
   const dryRun = args.flags["dry-run"] === true;
@@ -539,10 +572,20 @@ async function cmdBench(args: ParsedArgs): Promise<void> {
     typeof args.flags.sites === "string"
       ? args.flags.sites
       : join(cwd, "bench", "sites.json");
-  const limit = args.flags.limit ? Number(args.flags.limit) : undefined;
+  const limit = parseOptionalBoundedIntFlag("limit", args.flags.limit, 1, 1000);
   const onlyNames = splitCsv(args.flags.only);
-  const personasPerSite = args.flags.personas ? Number(args.flags.personas) : 2;
-  const flowsPerPersona = args.flags.flows ? Number(args.flags.flows) : 2;
+  const personasPerSite = parsePositiveIntFlag(
+    "personas",
+    args.flags.personas,
+    2,
+    { max: 100 },
+  );
+  const flowsPerPersona = parsePositiveIntFlag(
+    "flows",
+    args.flags.flows,
+    2,
+    { max: 50 },
+  );
   const model = typeof args.flags.model === "string" ? args.flags.model : DEFAULT_MODEL;
   const cacheEnabled = args.flags["no-cache"] !== true;
 
@@ -596,8 +639,18 @@ async function cmdSeed(args: ParsedArgs): Promise<void> {
         : process.cwd();
   const urls = splitCsv(args.flags.url);
   const model = typeof args.flags.model === "string" ? args.flags.model : DEFAULT_MODEL;
-  const numPersonas = args.flags.personas ? Number(args.flags.personas) : 4;
-  const flowsPerPersona = args.flags.flows ? Number(args.flags.flows) : 2;
+  const numPersonas = parsePositiveIntFlag(
+    "personas",
+    args.flags.personas,
+    4,
+    { max: 100 },
+  );
+  const flowsPerPersona = parsePositiveIntFlag(
+    "flows",
+    args.flags.flows,
+    2,
+    { max: 50 },
+  );
   const cacheEnabled = args.flags["no-cache"] !== true;
 
   if (urls.length === 0) {
@@ -653,7 +706,13 @@ async function cmdCrossReport(args: ParsedArgs): Promise<void> {
   if (explicitRuns.length > 0) opts.runDirs = explicitRuns;
   if (surfaceIds.length > 0) opts.surfaceIds = surfaceIds;
   if (args.flags.vet === true) opts.vet = true;
-  if (typeof args.flags["vet-top"] === "string") opts.vetTopN = Number(args.flags["vet-top"]);
+  const vetTopN = parseOptionalBoundedIntFlag(
+    "vet-top",
+    args.flags["vet-top"],
+    1,
+    1000,
+  );
+  if (vetTopN !== undefined) opts.vetTopN = vetTopN;
 
   if (opts.vet) console.log("gauntlet cross-report (vetting enabled - launching Playwright)");
 
@@ -714,8 +773,14 @@ async function cmdAuth(args: ParsedArgs): Promise<void> {
 }
 
 async function cmdSurfaces(): Promise<void> {
-  const surfaces = await loadAllSurfaces();
-  if (surfaces.length === 0) {
+  const { surfaces, diagnostics } = await loadAllSurfacesWithDiagnostics();
+  // Surface load errors before listing so the operator sees them even when
+  // the rest of the roster looks healthy. A typo in one yaml shouldn't
+  // silently disappear the surface from `gauntlet surfaces` output.
+  for (const d of diagnostics) {
+    console.error(`warn: skipping ${d.path}: ${d.reason}`);
+  }
+  if (surfaces.length === 0 && diagnostics.length === 0) {
     console.log("no surfaces curated yet. run `gauntlet init` to discover them.");
     return;
   }
@@ -725,20 +790,34 @@ async function cmdSurfaces(): Promise<void> {
     console.log(`  ${" ".repeat(24)}   audience: ${s.audience}`);
     if (s.base_url) console.log(`  ${" ".repeat(24)}   base_url: ${s.base_url}`);
   }
+  if (diagnostics.length > 0) {
+    process.exitCode = 1;
+  }
 }
 
 async function cmdList(): Promise<void> {
   const curated = await listCuratedPersonas();
+  let totalDiagnostics = 0;
   if (curated.length > 0) {
     console.log("curated personas (.gauntlet/personas/):");
     for (const id of curated) {
       const p = await loadPersona(id);
-      const flows = await loadFlowsForPersona(id);
+      const { flows, diagnostics } = await loadFlowsForPersonaWithDiagnostics(id);
+      for (const d of diagnostics) {
+        // Per-flow yaml errors are operator mistakes (hand-edits that
+        // broke the schema). Surface them with file path + reason so they
+        // can fix the file instead of staring at "0 flows".
+        console.error(`warn: skipping ${d.path}: ${d.reason}`);
+      }
+      totalDiagnostics += diagnostics.length;
       const flowSuffix = flows.length > 0 ? `  [${flows.length} flow${flows.length === 1 ? "" : "s"}]` : "";
       console.log(
         `  ${id.padEnd(28)} ${p.character.name} (${p.character.age ?? "?"})${flowSuffix}`,
       );
     }
+  }
+  if (totalDiagnostics > 0) {
+    process.exitCode = 1;
   }
   const allFlows = await listFlows();
   if (allFlows.length === 0 && curated.length > 0) {
@@ -765,7 +844,7 @@ async function cmdInit(args: ParsedArgs): Promise<void> {
   const urls = splitCsv(args.flags.url);
   const model =
     typeof args.flags.model === "string" ? args.flags.model : DEFAULT_MODEL;
-  const requested = args.flags.count ? Number(args.flags.count) : 10;
+  const requested = parsePositiveIntFlag("count", args.flags.count, 10, { max: 200 });
   // Operator-supplied "what should the testers focus on?" directive. Flows
   // forward into surface / persona / flow generation so the AI weights
   // discovery toward this area. Empty / unset = no directive.
@@ -817,8 +896,14 @@ async function cmdInit(args: ParsedArgs): Promise<void> {
   console.log(`  templates loaded: ${templates.length}`);
 
   // [Phase A2] Surfaces. Skip when --skip-surfaces; regen when
-  // --refresh-surfaces; otherwise reuse curated.
-  let surfaces = await loadAllSurfaces(cwd);
+  // --refresh-surfaces; otherwise reuse curated. Use the diagnostic-aware
+  // loader so a hand-edited surface yaml that broke its schema is surfaced
+  // here instead of silently disappearing from the roster.
+  const surfacesLoad = await loadAllSurfacesWithDiagnostics(cwd);
+  for (const d of surfacesLoad.diagnostics) {
+    console.error(`warn: skipping ${d.path}: ${d.reason}`);
+  }
+  let surfaces = surfacesLoad.surfaces;
   if (skipSurfaces) {
     if (surfaces.length === 0) {
       console.error(
@@ -941,7 +1026,7 @@ async function cmdFlows(args: ParsedArgs): Promise<void> {
   const model =
     typeof args.flags.model === "string" ? args.flags.model : DEFAULT_MODEL;
   const url = typeof args.flags.url === "string" ? args.flags.url : undefined;
-  const count = args.flags.count ? Number(args.flags.count) : 3;
+  const count = parsePositiveIntFlag("count", args.flags.count, 3, { max: 50 });
   const focus = typeof args.flags.focus === "string" ? args.flags.focus.trim() : "";
   const cacheEnabled = args.flags["no-cache"] !== true;
   const replaceFlag = args.flags.replace === true;
@@ -1245,6 +1330,13 @@ main()
     process.exit(0);
   })
   .catch((err) => {
+    // Bad numeric flag values are operator errors, not crashes. Print the
+    // friendly message + exit 2 (same convention as other "bad usage" exits)
+    // instead of dumping a stack trace.
+    if (err instanceof FlagParseError) {
+      console.error(`error: ${err.message}`);
+      process.exit(2);
+    }
     console.error("fatal:", err);
     process.exit(1);
   });

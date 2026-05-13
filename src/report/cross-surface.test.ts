@@ -1,5 +1,12 @@
-import { describe, expect, test } from "bun:test";
-import { buildCrossSurface, type SurfaceRun } from "./cross-surface.ts";
+import { afterEach, describe, expect, mock, test } from "bun:test";
+import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  buildCrossSurface,
+  buildCrossSurfaceReport,
+  type SurfaceRun,
+} from "./cross-surface.ts";
 import type { RunReport } from "./schema.ts";
 
 function mkRun(surfaceId: string, personaId: string, findings: { reason: string; axeRuleId?: string; title: string }[]): SurfaceRun {
@@ -121,5 +128,84 @@ describe("buildCrossSurface", () => {
     expect(r.patterns).toEqual([]);
     expect(r.surfaceUnique).toEqual([]);
     expect(r.totalUniqueSignatures).toBe(0);
+  });
+});
+
+/**
+ * Schema-at-disk-boundary regression coverage for codex audit finding #9.
+ * Pre-fix, `buildCrossSurfaceReport` JSON.parsed report.json files and cast
+ * them to RunReport, so a corrupt artifact silently flowed through and
+ * either crashed downstream code with confusing errors or produced wrong
+ * rollups. Post-fix the corrupt artifact is logged and skipped, and the
+ * good ones still aggregate.
+ */
+function writeRunReport(dir: string, report: unknown): void {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "report.json"), JSON.stringify(report), "utf8");
+  // Also drop a flow-result so detectSurfaceForRun finds a surface id.
+  const personaDir = join(dir, "persona-x", "flow-y");
+  mkdirSync(personaDir, { recursive: true });
+  writeFileSync(
+    join(personaDir, "flow-result.json"),
+    JSON.stringify({
+      persona: "persona-x",
+      flow: "flow-y",
+      url: "https://x.example.com",
+      surface: dir.endsWith("good") ? "good-surface" : "bad-surface",
+      startedAt: 0,
+      finishedAt: 1,
+      outcome: "completed",
+      steps: [],
+      failures: [],
+    }),
+    "utf8",
+  );
+}
+
+const validRunReport: RunReport = {
+  runId: "r",
+  runDir: "/runs/r",
+  url: "https://good.example.com",
+  startedAt: 0,
+  finishedAt: 1,
+  personas: [],
+  patterns: [],
+  totals: {
+    findings: 0,
+    verified: 0,
+    subjective: 0,
+    couldNotReplay: 0,
+    regressed: 0,
+    unverified: 0,
+  },
+};
+
+describe("buildCrossSurfaceReport - schema validation at disk boundary", () => {
+  afterEach(() => {
+    mock.restore();
+  });
+
+  test("aggregates valid run when sibling run report is corrupt", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "gauntlet-crosssurf-test-"));
+    mkdirSync(join(cwd, ".gauntlet"), { recursive: true });
+    const goodRun = join(cwd, "runs", "good");
+    const badRun = join(cwd, "runs", "bad");
+    writeRunReport(goodRun, validRunReport);
+    // Corrupt report: missing required fields.
+    writeRunReport(badRun, { runId: "bad", but: "no other fields" });
+
+    const warn = mock(() => {});
+    console.warn = warn as typeof console.warn;
+    const result = await buildCrossSurfaceReport({
+      cwd,
+      runDirs: [goodRun, badRun],
+    });
+
+    // Good run made it into the rollup, bad one was dropped with a warning.
+    expect(result.report.surfaces.length).toBe(1);
+    expect(result.report.surfaces[0]!.surfaceId).toBe("good-surface");
+    expect(warn).toHaveBeenCalled();
+    const warnMsg = String((warn.mock.calls[0] ?? [""])[0]);
+    expect(warnMsg).toContain("report.json");
   });
 });
