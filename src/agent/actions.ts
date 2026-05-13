@@ -144,6 +144,20 @@ export interface ActionContext {
 }
 
 /**
+ * Detect that an error from `provider.propose` originated in zod schema
+ * validation (rather than e.g. an HTTP/network failure). Providers throw a
+ * standard `Error` with a message starting with `<provider> output failed
+ * schema "<name>":` when safeParse fails — see src/ai/anthropic.ts:103,
+ * src/ai/openai.ts, src/ai/google.ts, src/ai/ollama.ts. Substring-matching
+ * the literal `output failed schema` is intentional and brittle in the right
+ * way: if a provider changes its error wording we want to NOT silently
+ * swallow it as a "model decline".
+ */
+function isSchemaRejection(message: string): boolean {
+  return message.includes("output failed schema");
+}
+
+/**
  * Three observation outcomes. `element` means an interactive outline element
  * was matched (the historical happy path). `text` means the persona's target
  * was a stat/label/empty-state value present in the page-text snippet but not
@@ -291,33 +305,74 @@ export interface ActResult {
 }
 
 /**
- * Pick an element AND an action to perform on it given the persona's
- * intent. Executes the action.
+ * Result wrapper for the propose-action call so we can fold zod-rejection
+ * into the normal control flow without leaking provider exceptions out of
+ * `act()`. Anything other than schema rejection (network failures, abort,
+ * provider auth errors) still throws — those aren't model-decline signals.
  */
-export async function act(ctx: ActionContext, instruction: string): Promise<ActResult> {
-  const outline = await getOutline(ctx.page);
-  const pick = await ctx.provider.propose({
-    messages: [
-      {
-        role: "system",
-        content: `You are driving a browser for a user. Given their intent and a numbered outline of visible interactive elements, choose ONE element and ONE action OR signal no match. Output ONLY JSON matching one of these shapes (discriminated by "action" or "match_kind"):
+type ProposeActionOutcome =
+  | { kind: "ok"; value: z.input<typeof ActionOrNoMatchSchema> }
+  | { kind: "schema_rejected"; message: string };
+
+async function proposeActionWithRecovery(
+  ctx: ActionContext,
+  instruction: string,
+  outline: OutlineElement[],
+): Promise<ProposeActionOutcome> {
+  try {
+    const value = await ctx.provider.propose({
+      messages: [
+        {
+          role: "system",
+          content: `You are driving a browser for a user. Given their intent and a numbered outline of visible interactive elements, choose ONE element and ONE action OR signal no match. Output ONLY JSON matching one of these shapes (discriminated by "action" or "match_kind"):
   { "match_kind": "element", "action": "click"|"scroll_to"|"hover", "idx": number, "reasoning": string, "confidence": number }
   { "match_kind": "element", "action": "fill"|"press"|"select",     "idx": number, "value": string, "reasoning": string, "confidence": number }
   { "match_kind": "none",    "reasoning": string, "confidence": number }
 
 Use match_kind="none" when nothing on the page matches the intent. For fill, value is the text to type. For press, value is the key (e.g. "Enter"). For select, value is the option to select. confidence is 0-100 — only above 60 will the action actually fire; below 60 the caller treats it as no_match. Be honest: 90+ for unambiguous matches, 60-89 when reasonably sure, <60 when guessing.${voicePreamble(ctx.personaVoice)}`,
-      },
-      {
-        role: "user",
-        content: `Outline:\n${summarizeOutline(outline)}\n\nIntent: "${instruction}"\n\nPick one action to take next, or signal match_kind="none".${recentStepsPreamble(ctx.recentSteps)}`,
-      },
-    ],
-    schema: ActionOrNoMatchSchema,
-    schemaName: "ActionPick",
-    maxTokens: 500,
-    temperature: 0,
-    ...(ctx.signal ? { signal: ctx.signal } : {}),
-  });
+        },
+        {
+          role: "user",
+          content: `Outline:\n${summarizeOutline(outline)}\n\nIntent: "${instruction}"\n\nPick one action to take next, or signal match_kind="none".${recentStepsPreamble(ctx.recentSteps)}`,
+        },
+      ],
+      schema: ActionOrNoMatchSchema,
+      schemaName: "ActionPick",
+      maxTokens: 500,
+      temperature: 0,
+      ...(ctx.signal ? { signal: ctx.signal } : {}),
+    });
+    return { kind: "ok", value };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (!isSchemaRejection(message)) throw err;
+    return { kind: "schema_rejected", message: message.split("\n")[0] ?? message };
+  }
+}
+
+/**
+ * Pick an element AND an action to perform on it given the persona's
+ * intent. Executes the action.
+ */
+export async function act(ctx: ActionContext, instruction: string): Promise<ActResult> {
+  const outline = await getOutline(ctx.page);
+  const pickResult = await proposeActionWithRecovery(ctx, instruction, outline);
+  if (pickResult.kind === "schema_rejected") {
+    // Schema-rejection recovery: when the AI returns a malformed shape (most
+    // commonly a locator-pick `{match_kind, idx, reasoning}` instead of an
+    // action-pick — observed during audplexus dogfood 2026-05-13), the
+    // provider throws on safeParse. Without this catch, the schema-validation
+    // error escapes runFlow and the entire flow lands `outcome="error"` for
+    // what is effectively a model decline. Treat schema rejection as no_match
+    // so the judge can decide give_up cleanly on its next iteration.
+    return {
+      performed: false,
+      action: undefined,
+      target: undefined,
+      reasoning: `AI returned non-action shape; treated as no_match. ${pickResult.message}`,
+    };
+  }
+  const pick = pickResult.value;
 
   const pickConfidence =
     typeof pick.confidence === "number" ? pick.confidence : 70;

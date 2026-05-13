@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  act,
   ActionOrNoMatchSchema,
   ActionPickSchema,
   LocatorPickSchema,
@@ -310,5 +311,63 @@ describe("ActionOrNoMatchSchema (act — accepts no_match too)", () => {
       confidence: 80,
     });
     expect(v.match_kind).toBe("none");
+  });
+});
+
+describe("act() schema-rejection recovery", () => {
+  // Real-world dogfood (audplexus 2026-05-13): the AI returned a locator-pick
+  // shape `{match_kind, idx, reasoning, confidence}` where act() expected an
+  // ActionPick. The new discriminated ActionOrNoMatchSchema correctly rejects
+  // it — but without recovery, the schema-validation error escapes runFlow
+  // and the entire flow lands `outcome="error"`. act() now treats schema
+  // rejection as no_match so the judge can decide give_up cleanly.
+  function makeFakePage() {
+    return {
+      evaluate: async (script: string) => {
+        if (script.includes("document.body ? document.body.innerText")) return "";
+        return [
+          { idx: 0, role: "button", name: "Submit", tag: "button", visible: true },
+        ];
+      },
+    };
+  }
+
+  function makeRejectingProvider(message: string): AiProvider {
+    return {
+      name: "fake",
+      model: "fake-1",
+      async propose<T>(_opts: ProposeOptions<T>): Promise<T> {
+        throw new Error(message);
+      },
+    };
+  }
+
+  test("schema-validation error from provider degrades to no_match (not an exception)", async () => {
+    const page = makeFakePage();
+    const provider = makeRejectingProvider(
+      `anthropic output failed schema "ActionPick":\n  : Invalid input\n--- raw ---\n{"match_kind":"element","idx":3,"reasoning":"clicked"}`,
+    );
+    const ctx: ActionContext = {
+      provider,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      page: page as any,
+    };
+    const result = await act(ctx, "submit the form");
+    expect(result.performed).toBe(false);
+    expect(result.action).toBeUndefined();
+    expect(result.target).toBeUndefined();
+    expect(result.reasoning).toContain("non-action shape");
+    expect(result.reasoning).toContain("output failed schema");
+  });
+
+  test("non-schema errors still propagate (e.g. network failure)", async () => {
+    const page = makeFakePage();
+    const provider = makeRejectingProvider("ECONNREFUSED");
+    const ctx: ActionContext = {
+      provider,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      page: page as any,
+    };
+    await expect(act(ctx, "submit the form")).rejects.toThrow("ECONNREFUSED");
   });
 });
