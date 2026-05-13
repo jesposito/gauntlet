@@ -132,6 +132,35 @@ export interface VetOptions {
    * Pass the run's project root when vetting reports built outside the user's cwd.
    */
   cwd?: string;
+  /**
+   * Per-finding wallclock budget. Mirrors the runner's classifyFlowError
+   * pattern: if the per-finding session (open + navigate + axe + map) hangs
+   * past this budget, the finding lands `could_not_replay` and the loop
+   * continues. Without it a single hung axe call (most likely culprit:
+   * `AxeBuilder.analyze()` against a heavy SPA) freezes the entire vetter.
+   * Real-world dogfood (audplexus 2026-05-13, third run): vetter hung 20+
+   * minutes holding chromium with no progress.
+   */
+  perFindingBudgetMs?: number;
+}
+
+/**
+ * Per-finding wallclock for the vetter. Race the work against a setTimeout
+ * reject so a hung Playwright op (most often `AxeBuilder.analyze()`) can't
+ * stall the whole vetting pass. The promise-rejected path is what callers
+ * branch on; the timer is cleared on resolve.
+ */
+export function withVetTimeout<T>(label: string, p: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`vet timeout: ${label} exceeded ${ms}ms`)),
+      ms,
+    );
+  });
+  return Promise.race([p, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
 }
 
 /**
@@ -143,6 +172,9 @@ export async function vetAll(findings: Finding[], opts: VetOptions = {}): Promis
   if (findings.length === 0) return findings;
   const headless = opts.headless ?? true;
   const timeoutMs = opts.timeoutMs ?? 30_000;
+  // Per-finding budget = navigation timeout + axe room + slack. Default
+  // 60s so a heavy SPA's axe scan can finish, but never indefinite.
+  const perFindingBudgetMs = opts.perFindingBudgetMs ?? 60_000;
   const cwd = opts.cwd ?? process.cwd();
 
   // Resolve each finding's surface.auth_state once. Surfaces without
@@ -192,22 +224,42 @@ export async function vetAll(findings: Finding[], opts: VetOptions = {}): Promis
         });
         continue;
       }
-      const authState = await authStateFor(f.surfaceId);
-      const sessionKey = `${f.url}|${authState ?? ""}`;
-      let session = sessions.get(sessionKey);
-      if (!session) {
-        session = await openSession(browser, f.url, timeoutMs, authState);
-        sessions.set(sessionKey, session);
+      try {
+        const authState = await authStateFor(f.surfaceId);
+        const sessionKey = `${f.url}|${authState ?? ""}`;
+        let session = sessions.get(sessionKey);
+        if (!session) {
+          session = await withVetTimeout(
+            `openSession(${f.url})`,
+            openSession(browser, f.url, timeoutMs, authState),
+            perFindingBudgetMs,
+          );
+          sessions.set(sessionKey, session);
+        }
+        const v = vetFromSession(f, session);
+        out.push({
+          ...f,
+          vetting: {
+            status: v.status,
+            note: v.note,
+            ...(v.rePassed !== undefined ? { rePassed: v.rePassed } : {}),
+          },
+        });
+      } catch (err) {
+        // Per-finding timeout (or any other openSession failure) — record as
+        // could_not_replay and keep going. The session, if partially opened,
+        // is leaked here for the duration of this vetAll call; the outer
+        // try/finally still reaps the browser at the end. Worth a follow-up
+        // if vetter passes ever stretch into thousands of findings.
+        const message = err instanceof Error ? err.message : String(err);
+        out.push({
+          ...f,
+          vetting: {
+            status: "could_not_replay",
+            note: `vetter failure: ${message}`,
+          },
+        });
       }
-      const v = vetFromSession(f, session);
-      out.push({
-        ...f,
-        vetting: {
-          status: v.status,
-          note: v.note,
-          ...(v.rePassed !== undefined ? { rePassed: v.rePassed } : {}),
-        },
-      });
     }
   } finally {
     for (const s of sessions.values()) await closeSession(s);

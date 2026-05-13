@@ -34,11 +34,31 @@ export interface AxeScanResult {
 
 const TAGS = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa", "best-practice"];
 
+/**
+ * Defensive backstop: AxeBuilder.analyze() can hang indefinitely on heavy
+ * SPAs that never settle (most often due to a long-running MutationObserver
+ * inside axe's own injected runtime). Cap the call so a single bad page
+ * can't freeze the runner OR the vetter. The thrown error lands in the
+ * existing `catch` below and surfaces as `error` on the result, same as
+ * any other axe failure — callers don't need to learn a new shape.
+ */
+const AXE_ANALYZE_TIMEOUT_MS = 30_000;
+
 export async function runAxe(page: Page): Promise<AxeScanResult> {
   const ranAt = Date.now();
   const url = page.url();
   try {
-    const results = await new AxeBuilder({ page }).withTags(TAGS).analyze();
+    const analyze = new AxeBuilder({ page }).withTags(TAGS).analyze();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`axe analyze timeout: exceeded ${AXE_ANALYZE_TIMEOUT_MS}ms`)),
+        AXE_ANALYZE_TIMEOUT_MS,
+      );
+    });
+    const results = await Promise.race([analyze, timeout]).finally(() => {
+      if (timer) clearTimeout(timer);
+    });
     const violations: AxeViolation[] = results.violations.map((v) => {
       const tp = classifyAxeViolation(
         v.nodes.map((n) => ({
