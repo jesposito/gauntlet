@@ -63,6 +63,21 @@ export interface JudgeContext {
   signal?: AbortSignal;
 }
 
+/**
+ * Post-parse fix-up: the AI sometimes omits give_up_class even when the prompt
+ * says "you MUST set give_up_class". The schema accepts that (optional) so the
+ * runner doesn't crash mid-flow, but the auto-downgrade in report rendering
+ * can't run without a class. Default missing -> "bug" so non-classified
+ * abandons keep their original severity, and a missing class never silently
+ * suppresses a real defect.
+ */
+export function ensureGiveUpClass(v: StepVerdict): StepVerdict {
+  if (v.status === "give_up" && !v.give_up_class) {
+    return { ...v, give_up_class: "bug" };
+  }
+  return v;
+}
+
 export async function judgeStep(ctx: JudgeContext): Promise<StepVerdict> {
   const outline = await getOutline(ctx.page);
   const pageText = await getPageText(ctx.page, 3000);
@@ -110,7 +125,7 @@ When status="give_up", you MUST set give_up_class to one of:
 
 Evidence must reference observable state: an outline index, a literal URL, a literal page title, a literal heading text, a snippet from the page-text, or the last-action result. Do not write evidence like "this looks frustrating" — that is not evidence.${voicePreamble}`;
 
-  return ctx.provider.propose({
+  const verdict = await ctx.provider.propose({
     messages: [
       { role: "system", content: SYSTEM },
       {
@@ -143,4 +158,5 @@ Verdict? Remember: bias toward in_progress; before declaring give_up, check for 
     temperature: 0,
     ...(ctx.signal ? { signal: ctx.signal } : {}),
   });
+  return ensureGiveUpClass(verdict);
 }
