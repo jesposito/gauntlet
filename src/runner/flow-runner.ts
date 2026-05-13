@@ -27,8 +27,10 @@ const STEP_OP_TIMEOUT_MS = 60_000;
  * Hard wallclock cap per flow. Even if every step succeeds within the per-step
  * timeout, the cumulative budget is bounded so a runaway flow can't hold up
  * the concurrent pool indefinitely. Tuned to ~10x a typical persona patience.
+ * Overridable via FlowRunOptions.wallclockBudgetMs (used by tests to exercise
+ * the alarm path without burning real wallclock).
  */
-const FLOW_WALLCLOCK_BUDGET_MS = 5 * 60_000;
+export const FLOW_WALLCLOCK_BUDGET_MS = 5 * 60_000;
 
 class StepTimeoutError extends Error {
   constructor(label: string, ms: number) {
@@ -125,6 +127,12 @@ export interface FlowRunOptions {
   onEvent?: FlowEventHandler;
   storageStatePath?: string;
   surfaceId?: string;
+  /**
+   * Override the wallclock budget for this flow. Defaults to
+   * FLOW_WALLCLOCK_BUDGET_MS. Tests use this to drive the timeout path on
+   * sub-second budgets; production code should not pass it.
+   */
+  wallclockBudgetMs?: number;
 }
 
 export interface StepResult {
@@ -148,6 +156,37 @@ export interface FlowRunResult {
   durationMs: number;
 }
 
+/**
+ * Classify a flow outcome when the body throws OR when the wallclock alarm
+ * fires. Pure function so it can be tested in isolation. Codified rules:
+ *
+ *   - If the wallclock alarm fired, the outcome is ALWAYS "timeout",
+ *     regardless of which error type the inner throw surfaced — Playwright
+ *     reports browser-close as a generic Error, not a domain-specific timeout.
+ *     The wallclock-induced close is the cause; the error is the symptom.
+ *   - If the wallclock did not fire, the outcome is "error" with the message
+ *     surfaced verbatim.
+ *
+ * Exposed so the test suite can lock the contract that wallclock-triggered
+ * errors are reclassified as timeouts before reaching the CLI.
+ */
+export function classifyFlowError(args: {
+  err: unknown;
+  wallclockFired: boolean;
+  wallclockBudgetMs: number;
+}): { outcome: FlowRunResult["outcome"]; outcomeReason: string } {
+  if (args.wallclockFired) {
+    return {
+      outcome: "timeout",
+      outcomeReason: `flow wallclock alarm fired at ${args.wallclockBudgetMs / 1000}s — browser force-closed`,
+    };
+  }
+  return {
+    outcome: "error",
+    outcomeReason: args.err instanceof Error ? args.err.message : String(args.err),
+  };
+}
+
 function resolveStartUrl(baseUrl: string, hint: string | undefined): string {
   if (!hint) return baseUrl;
   if (/^https?:\/\//.test(hint)) return hint;
@@ -165,6 +204,7 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
   const { url, persona, flow, provider, runDir } = opts;
   const headless = opts.headless ?? true;
   const emit: FlowEventHandler = opts.onEvent ?? (() => undefined);
+  const wallclockBudgetMs = opts.wallclockBudgetMs ?? FLOW_WALLCLOCK_BUDGET_MS;
 
   await ensureRunDir(runDir);
   const startedAt = Date.now();
@@ -202,7 +242,7 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
     // inside the step loop. No await — we don't want this setTimeout
     // callback itself blocked on close.
     browser?.close().catch(() => undefined);
-  }, FLOW_WALLCLOCK_BUDGET_MS);
+  }, wallclockBudgetMs);
   const ua = DEVICE_USER_AGENTS[persona.behavior.device] ?? DEVICE_USER_AGENTS.desktop!;
   context = await browser.newContext({
     viewport: persona.behavior.viewport,
@@ -349,9 +389,9 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
       // step succeeds within its timeout, the flow can't run longer than
       // FLOW_WALLCLOCK_BUDGET_MS total. Protects the concurrent pool slot.
       const elapsedMs = Date.now() - startedAt;
-      if (elapsedMs > FLOW_WALLCLOCK_BUDGET_MS) {
+      if (elapsedMs > wallclockBudgetMs) {
         outcome = "timeout";
-        outcomeReason = `flow wallclock budget (${FLOW_WALLCLOCK_BUDGET_MS / 1000}s) exceeded after ${(elapsedMs / 1000).toFixed(1)}s`;
+        outcomeReason = `flow wallclock budget (${wallclockBudgetMs / 1000}s) exceeded after ${(elapsedMs / 1000).toFixed(1)}s`;
         failures.push({
           reason: FailureReason.NAVIGATION_TIMEOUT,
           message: outcomeReason,
@@ -406,11 +446,24 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
           STEP_OP_TIMEOUT_MS,
           "observe",
         );
-        emit({ type: "step_observe", personaId: persona.id, flowId: flow.id, stepIndex: i, matched: !!obs.match, reasoning: obs.reasoning });
-        if (!obs.match) {
+        // matched=true for both element and text-snippet matches. Text-snippet
+        // observation is a real success — the persona's target is something
+        // like "count of failed jobs" living in a stat card that the
+        // role-based outline cannot represent. Only match_kind="none" is an
+        // observation failure that should trigger persona abandonment.
+        emit({
+          type: "step_observe",
+          personaId: persona.id,
+          flowId: flow.id,
+          stepIndex: i,
+          matched: obs.match_kind !== "none",
+          reasoning: obs.reasoning,
+        });
+        if (obs.match_kind === "none") {
           const verdict: StepVerdict = {
             status: "give_up",
             give_up_reason: `expected to see ${step.observation_target}, but it isn't on the page`,
+            give_up_class: "bug",
             evidence: obs.reasoning,
           };
           const capture = await withTimeout(
@@ -438,6 +491,40 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
           outcome = "abandoned";
           outcomeReason = verdict.give_up_reason;
           break;
+        }
+        if (obs.match_kind === "text") {
+          // Text-snippet match: the persona's observation target was satisfied
+          // by visible page text (a stat card, status banner, empty-state
+          // copy) that the role-based outline cannot represent. There is no
+          // element to act on — record the step as observed-success and move
+          // on to the next step. Skipping act/judge avoids forcing the actor
+          // to invent an action against text content.
+          const verdict: StepVerdict = {
+            status: "success",
+            evidence: obs.reasoning,
+          };
+          const capture = await withTimeout(
+            captureStep(page, cdp, captureCtx, i),
+            STEP_OP_TIMEOUT_MS,
+            "captureStep(observe-text-match)",
+          );
+          stepResults.push({
+            stepIndex: i,
+            intent: step.intent,
+            action: undefined,
+            performed: false,
+            verdict,
+            capture,
+          });
+          emit({
+            type: "step_verdict",
+            personaId: persona.id,
+            flowId: flow.id,
+            stepIndex: i,
+            status: "success",
+            evidence: verdict.evidence,
+          });
+          continue;
         }
       }
 
@@ -546,14 +633,17 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
       if (verdict.status === "give_up") {
         failures.push({
           reason: FailureReason.ABANDONED_BY_PERSONA,
-          message: `step ${i + 1}: ${verdict.give_up_reason ?? "give_up"} — ${verdict.evidence}`,
+          message: `step ${i + 1}: ${verdict.give_up_reason} — ${verdict.evidence}`,
           timestamp: Date.now(),
           stepIndex: i,
           url: page.url(),
-          metadata: { evidence: verdict.evidence },
+          metadata: {
+            evidence: verdict.evidence,
+            giveUpClass: verdict.give_up_class,
+          },
         });
         outcome = "abandoned";
-        outcomeReason = verdict.give_up_reason ?? "give_up";
+        outcomeReason = verdict.give_up_reason;
         break;
       }
       } catch (err) {
@@ -575,41 +665,37 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
     }
   }
 
-  await writeFile(
-    join(runDir, "flow-result.json"),
-    JSON.stringify(
-      {
-        persona: persona.id,
-        flow: flow.id,
-        url,
-        startUrl,
-        ...(opts.surfaceId ? { surface: opts.surfaceId } : {}),
-        startedAt,
-        finishedAt: Date.now(),
-        outcome,
-        outcomeReason,
-        steps: stepResults.map((s) => ({
-          stepIndex: s.stepIndex,
-          intent: s.intent,
-          action: s.action,
-          performed: s.performed,
-          verdict: s.verdict,
-        })),
-        failures,
-      },
-      null,
-      2,
-    ),
-    "utf8",
-  );
-
+  } catch (err) {
+    // Outer body threw before we could record an outcome through normal flow.
+    // Delegate to classifyFlowError so the rule (wallclockFired => "timeout",
+    // otherwise => "error") lives in one testable place and can't drift.
+    const c = classifyFlowError({ err, wallclockFired, wallclockBudgetMs });
+    outcome = c.outcome;
+    outcomeReason = c.outcomeReason;
+    if (wallclockFired) {
+      failures.push({
+        reason: FailureReason.NAVIGATION_TIMEOUT,
+        message: c.outcomeReason,
+        timestamp: Date.now(),
+        stepIndex: stepResults.length,
+        url: startUrl,
+      });
+    }
   } finally {
     if (wallclockAlarm) clearTimeout(wallclockAlarm);
+    // Backstop: if the wallclock fired but the body somehow still left
+    // outcome="completed" (e.g. alarm fired during the writeFile after the
+    // last step succeeded), correct it here. The catch above handles the
+    // common case (in-flight throw); this finally handles the rare case
+    // (no throw because the body was between awaits when the alarm fired).
     if (wallclockFired && outcome === "completed") {
-      // Wallclock alarm fired but the body didn't see it through outcome.
-      // Mark the flow accordingly so the report reflects what happened.
-      outcome = "timeout";
-      outcomeReason = `flow wallclock alarm fired at ${FLOW_WALLCLOCK_BUDGET_MS / 1000}s — browser force-closed`;
+      const c = classifyFlowError({
+        err: new Error("wallclock"),
+        wallclockFired: true,
+        wallclockBudgetMs,
+      });
+      outcome = c.outcome;
+      outcomeReason = c.outcomeReason;
     }
     // Close with hard timeouts; if Playwright hangs, force-kill the browser
     // process rather than blocking the entire run forever. Wrapped in
@@ -632,7 +718,43 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
     }
   }
 
+  // flow-result.json is written AFTER outcome normalization (post-finally) so
+  // the on-disk artifact always reflects the final outcome — including
+  // wallclock-induced timeouts that the catch above reclassified.
   const durationMs = Date.now() - startedAt;
+  try {
+    await writeFile(
+      join(runDir, "flow-result.json"),
+      JSON.stringify(
+        {
+          persona: persona.id,
+          flow: flow.id,
+          url,
+          startUrl,
+          ...(opts.surfaceId ? { surface: opts.surfaceId } : {}),
+          startedAt,
+          finishedAt: Date.now(),
+          outcome,
+          outcomeReason,
+          steps: stepResults.map((s) => ({
+            stepIndex: s.stepIndex,
+            intent: s.intent,
+            action: s.action,
+            performed: s.performed,
+            verdict: s.verdict,
+          })),
+          failures,
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+  } catch {
+    // Disk-full / permission failure on the artifact write should not mask
+    // the in-memory result we're about to return.
+  }
+
   emit({ type: "flow_end", personaId: persona.id, flowId: flow.id, outcome, durationMs });
 
   return {

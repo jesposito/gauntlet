@@ -3,41 +3,119 @@ import type { Locator, Page } from "playwright";
 import type { AiProvider } from "../ai/provider.ts";
 import {
   getOutline,
+  getPageText,
   summarizeOutline,
   type OutlineElement,
 } from "./dom-outline.ts";
 
-export const LocatorPickSchema = z.object({
+/**
+ * Outcome of an observe() pick. Three states because text-snippet-only matches
+ * are real successes — collapsing them into idx=-1 (the historical contract)
+ * caused the runner to record persona-abandonment for "saw the value in the
+ * page text" outcomes (the audplexus dogfood false-positive). The
+ * discriminated union makes the three states unrepresentable as anything but
+ * one of: an outline-index match, a text-snippet match, or no match at all.
+ */
+const ConfidenceField = z
+  .number()
+  .int()
+  .min(0)
+  .max(100)
+  .default(70)
+  .describe(
+    "0-100 confidence the verdict is correct. Be honest: 90+ only for unambiguous matches (exact name + role + clear semantic match). 60-89 when reasonably sure. <60 when guessing — caller will treat as no_match.",
+  );
+
+export const LocatorPickSchema = z.discriminatedUnion("match_kind", [
+  z.object({
+    match_kind: z
+      .literal("element")
+      .describe("An interactive outline element matches the instruction."),
+    idx: z
+      .number()
+      .int()
+      .min(0)
+      .describe("Index of the chosen element from the outline."),
+    reasoning: z.string().describe("One sentence: why this element matches."),
+    confidence: ConfidenceField,
+  }),
+  z.object({
+    match_kind: z
+      .literal("text")
+      .describe(
+        "The persona's target is purely textual (e.g. 'count of failed jobs') and is present in the page-text snippet but not as an interactive element.",
+      ),
+    reasoning: z
+      .string()
+      .describe(
+        "One sentence: which page-text snippet supplies the match (cite the literal text).",
+      ),
+    confidence: ConfidenceField,
+  }),
+  z.object({
+    match_kind: z
+      .literal("none")
+      .describe("Nothing on the page matches the instruction."),
+    reasoning: z.string().describe("One sentence: why nothing matches."),
+    confidence: ConfidenceField,
+  }),
+]);
+
+/**
+ * Action schema. Discriminated on `action` so that fill/press/select require
+ * `value` and the others forbid it. Previously a flat schema with `value`
+ * always optional admitted "fill with no value" — invalid output that only
+ * blew up at runtime as "action failed", polluting the judge signal.
+ */
+const BaseActionFields = {
+  match_kind: z.literal("element"),
   idx: z
     .number()
     .int()
-    .min(-1)
-    .describe(
-      "Index of the chosen element from the outline. Use -1 if nothing matches.",
-    ),
-  reasoning: z.string().describe("One sentence: why this element matches."),
-  confidence: z
-    .number()
-    .int()
     .min(0)
-    .max(100)
-    .default(70)
-    .describe(
-      "0-100 confidence the picked element is correct. Be honest: 90+ only for unambiguous matches (exact name + role + clear semantic match). 60-89 when reasonably sure. <60 when guessing — caller will treat as no_match.",
-    ),
-});
+    .describe("Index of the chosen element from the outline."),
+  reasoning: z.string().describe("One sentence: why this element matches."),
+  confidence: ConfidenceField,
+} as const;
 
-export const ActionPickSchema = LocatorPickSchema.extend({
-  action: z.enum(["click", "fill", "press", "select", "scroll_to", "hover"]),
-  value: z
-    .string()
-    .optional()
-    .describe(
-      "Value to fill, key to press, or option to select. Required for fill/press/select.",
-    ),
-});
+export const ActionPickSchema = z.discriminatedUnion("action", [
+  z.object({ ...BaseActionFields, action: z.literal("click") }),
+  z.object({
+    ...BaseActionFields,
+    action: z.literal("fill"),
+    value: z.string().describe("Value to fill into the element."),
+  }),
+  z.object({
+    ...BaseActionFields,
+    action: z.literal("press"),
+    value: z.string().describe("Key to press (e.g. 'Enter', 'Escape')."),
+  }),
+  z.object({
+    ...BaseActionFields,
+    action: z.literal("select"),
+    value: z.string().describe("Option value to select."),
+  }),
+  z.object({ ...BaseActionFields, action: z.literal("scroll_to") }),
+  z.object({ ...BaseActionFields, action: z.literal("hover") }),
+]);
+
+/**
+ * What the AI may return for the action picker. When nothing on the page
+ * matches the intent, the model emits `{ match_kind: "none", reasoning, ... }`
+ * rather than an action — the caller treats that as no_match. The act layer
+ * runs the discriminated union below to validate.
+ */
+export const ActionOrNoMatchSchema = z.union([
+  ActionPickSchema,
+  z.object({
+    match_kind: z.literal("none"),
+    reasoning: z.string().describe("One sentence: why nothing on the page matches."),
+    confidence: ConfidenceField,
+  }),
+]);
 
 export type ActionPick = z.infer<typeof ActionPickSchema>;
+export type ActionOrNoMatch = z.infer<typeof ActionOrNoMatchSchema>;
 export type LocatorPick = z.infer<typeof LocatorPickSchema>;
 
 export interface ActionContext {
@@ -65,17 +143,47 @@ export interface ActionContext {
   }>;
 }
 
-export interface ObserveResult {
-  match: OutlineElement | undefined;
-  reasoning: string;
-  outline: OutlineElement[];
-  /**
-   * 0-100 self-reported confidence the picked element is correct. Callers
-   * threshold this (default 60) and treat low-confidence picks the same as
-   * no_match — better to bail honestly than commit to a wrong locator.
-   */
-  confidence: number;
+/**
+ * Detect that an error from `provider.propose` originated in zod schema
+ * validation (rather than e.g. an HTTP/network failure). Providers throw a
+ * standard `Error` with a message starting with `<provider> output failed
+ * schema "<name>":` when safeParse fails — see src/ai/anthropic.ts:103,
+ * src/ai/openai.ts, src/ai/google.ts, src/ai/ollama.ts. Substring-matching
+ * the literal `output failed schema` is intentional and brittle in the right
+ * way: if a provider changes its error wording we want to NOT silently
+ * swallow it as a "model decline".
+ */
+function isSchemaRejection(message: string): boolean {
+  return message.includes("output failed schema");
 }
+
+/**
+ * Three observation outcomes. `element` means an interactive outline element
+ * was matched (the historical happy path). `text` means the persona's target
+ * was a stat/label/empty-state value present in the page-text snippet but not
+ * in the role-based outline — still a successful observation; the runner
+ * should NOT treat it as abandonment. `none` means nothing matched.
+ */
+export type ObserveResult =
+  | {
+      match_kind: "element";
+      match: OutlineElement;
+      reasoning: string;
+      outline: OutlineElement[];
+      confidence: number;
+    }
+  | {
+      match_kind: "text";
+      reasoning: string;
+      outline: OutlineElement[];
+      confidence: number;
+    }
+  | {
+      match_kind: "none";
+      reasoning: string;
+      outline: OutlineElement[];
+      confidence: number;
+    };
 
 /**
  * Below this confidence value, observe() reports no match even when the AI
@@ -112,15 +220,21 @@ export async function observe(
   instruction: string,
 ): Promise<ObserveResult> {
   const outline = await getOutline(ctx.page);
+  const pageText = await getPageText(ctx.page, 2000);
   const result = await ctx.provider.propose({
     messages: [
       {
         role: "system",
-        content: `You pick the best-matching page element from a numbered outline. Output ONLY JSON matching {"idx": number, "reasoning": string, "confidence": number}. idx is the element index, or -1 if nothing matches. confidence is 0-100 reflecting how certain you are: 90+ for unambiguous matches (exact name + role + clear semantic match), 60-89 when reasonably sure, <60 when guessing (callers will treat <60 as no_match).${voicePreamble(ctx.personaVoice)}`,
+        content: `You pick the best-matching page element from a numbered outline. Output ONLY JSON matching one of three discriminated shapes keyed on "match_kind":
+  { "match_kind": "element", "idx": number, "reasoning": string, "confidence": number }
+  { "match_kind": "text",    "reasoning": string, "confidence": number }
+  { "match_kind": "none",    "reasoning": string, "confidence": number }
+
+Use "element" when an interactive outline entry matches the instruction; idx is the element index. Use "text" when the persona's target is purely textual ("count of failed jobs", "total books label", "empty-state copy", a <summary> label content) and you can find that literal text in the page-text snippet — cite the snippet in reasoning. Use "none" when nothing on the page matches. confidence is 0-100: 90+ for unambiguous matches, 60-89 when reasonably sure, <60 when guessing (callers will treat <60 as no_match). A <summary> entry in the outline is a collapsed disclosure widget (native <details>) — if the persona is looking for help text or instructions and a relevant <summary> label is present, prefer match_kind="element" with that summary's idx so the actor can expand it.${voicePreamble(ctx.personaVoice)}`,
       },
       {
         role: "user",
-        content: `Outline of visible interactive elements on this page:\n${summarizeOutline(outline)}\n\nInstruction: "${instruction}"\n\nReturn the matching idx, or -1 if no element matches.${recentStepsPreamble(ctx.recentSteps)}`,
+        content: `Outline of visible interactive elements on this page:\n${summarizeOutline(outline)}\n\nPage-text snippet (supplemental, for content not in the outline):\n${pageText || "(no body text captured)"}\n\nInstruction: "${instruction}"\n\nReturn one of the three discriminated shapes.${recentStepsPreamble(ctx.recentSteps)}`,
       },
     ],
     schema: LocatorPickSchema,
@@ -129,18 +243,41 @@ export async function observe(
     temperature: 0,
     ...(ctx.signal ? { signal: ctx.signal } : {}),
   });
-  const confidence = typeof result.confidence === "number" ? result.confidence : 70;
-  // Low-confidence picks are treated as no_match. Better to bail honestly
-  // than commit to a wrong locator + cascade through act/judge.
-  const match =
-    result.idx >= 0 && confidence >= OBSERVE_CONFIDENCE_THRESHOLD
-      ? outline[result.idx]
-      : undefined;
-  const reasoning =
-    result.idx >= 0 && confidence < OBSERVE_CONFIDENCE_THRESHOLD
-      ? `low confidence (${confidence}/100) — treating as no_match. ${result.reasoning}`
-      : result.reasoning;
-  return { match, reasoning, outline, confidence };
+
+  const confidence =
+    typeof result.confidence === "number" ? result.confidence : 70;
+
+  // Low-confidence picks are treated as no_match regardless of what the model
+  // claimed. Better to bail honestly than commit to a wrong locator + cascade
+  // through act/judge.
+  if (confidence < OBSERVE_CONFIDENCE_THRESHOLD) {
+    return {
+      match_kind: "none",
+      reasoning: `low confidence (${confidence}/100) — treating as no_match. ${result.reasoning}`,
+      outline,
+      confidence,
+    };
+  }
+
+  if (result.match_kind === "element") {
+    const el = outline[result.idx];
+    if (!el) {
+      // Out-of-bounds idx from the model — collapse to no_match.
+      return {
+        match_kind: "none",
+        reasoning: `out-of-bounds idx ${result.idx} (outline has ${outline.length} entries). ${result.reasoning}`,
+        outline,
+        confidence,
+      };
+    }
+    return { match_kind: "element", match: el, reasoning: result.reasoning, outline, confidence };
+  }
+
+  if (result.match_kind === "text") {
+    return { match_kind: "text", reasoning: result.reasoning, outline, confidence };
+  }
+
+  return { match_kind: "none", reasoning: result.reasoning, outline, confidence };
 }
 
 function buildLocator(page: Page, el: OutlineElement): Locator {
@@ -168,31 +305,79 @@ export interface ActResult {
 }
 
 /**
+ * Result wrapper for the propose-action call so we can fold zod-rejection
+ * into the normal control flow without leaking provider exceptions out of
+ * `act()`. Anything other than schema rejection (network failures, abort,
+ * provider auth errors) still throws — those aren't model-decline signals.
+ */
+type ProposeActionOutcome =
+  | { kind: "ok"; value: z.input<typeof ActionOrNoMatchSchema> }
+  | { kind: "schema_rejected"; message: string };
+
+async function proposeActionWithRecovery(
+  ctx: ActionContext,
+  instruction: string,
+  outline: OutlineElement[],
+): Promise<ProposeActionOutcome> {
+  try {
+    const value = await ctx.provider.propose({
+      messages: [
+        {
+          role: "system",
+          content: `You are driving a browser for a user. Given their intent and a numbered outline of visible interactive elements, choose ONE element and ONE action OR signal no match. Output ONLY JSON matching one of these shapes (discriminated by "action" or "match_kind"):
+  { "match_kind": "element", "action": "click"|"scroll_to"|"hover", "idx": number, "reasoning": string, "confidence": number }
+  { "match_kind": "element", "action": "fill"|"press"|"select",     "idx": number, "value": string, "reasoning": string, "confidence": number }
+  { "match_kind": "none",    "reasoning": string, "confidence": number }
+
+Use match_kind="none" when nothing on the page matches the intent. For fill, value is the text to type. For press, value is the key (e.g. "Enter"). For select, value is the option to select. confidence is 0-100 — only above 60 will the action actually fire; below 60 the caller treats it as no_match. Be honest: 90+ for unambiguous matches, 60-89 when reasonably sure, <60 when guessing.${voicePreamble(ctx.personaVoice)}`,
+        },
+        {
+          role: "user",
+          content: `Outline:\n${summarizeOutline(outline)}\n\nIntent: "${instruction}"\n\nPick one action to take next, or signal match_kind="none".${recentStepsPreamble(ctx.recentSteps)}`,
+        },
+      ],
+      schema: ActionOrNoMatchSchema,
+      schemaName: "ActionPick",
+      maxTokens: 500,
+      temperature: 0,
+      ...(ctx.signal ? { signal: ctx.signal } : {}),
+    });
+    return { kind: "ok", value };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (!isSchemaRejection(message)) throw err;
+    return { kind: "schema_rejected", message: message.split("\n")[0] ?? message };
+  }
+}
+
+/**
  * Pick an element AND an action to perform on it given the persona's
  * intent. Executes the action.
  */
 export async function act(ctx: ActionContext, instruction: string): Promise<ActResult> {
   const outline = await getOutline(ctx.page);
-  const pick = await ctx.provider.propose({
-    messages: [
-      {
-        role: "system",
-        content: `You are driving a browser for a user. Given their intent and a numbered outline of visible interactive elements, choose ONE element and ONE action. Output ONLY JSON matching {"idx": number, "action": "click"|"fill"|"press"|"select"|"scroll_to"|"hover", "value": string?, "reasoning": string, "confidence": number}. Use idx=-1 if nothing on the page matches the intent. For fill/press/select, value is required. confidence is 0-100 — only above 60 will the action actually fire; below 60 the caller treats it as no_match. Be honest: 90+ for unambiguous matches, 60-89 when reasonably sure, <60 when guessing.${voicePreamble(ctx.personaVoice)}`,
-      },
-      {
-        role: "user",
-        content: `Outline:\n${summarizeOutline(outline)}\n\nIntent: "${instruction}"\n\nPick one action to take next.${recentStepsPreamble(ctx.recentSteps)}`,
-      },
-    ],
-    schema: ActionPickSchema,
-    schemaName: "ActionPick",
-    maxTokens: 500,
-    temperature: 0,
-    ...(ctx.signal ? { signal: ctx.signal } : {}),
-  });
+  const pickResult = await proposeActionWithRecovery(ctx, instruction, outline);
+  if (pickResult.kind === "schema_rejected") {
+    // Schema-rejection recovery: when the AI returns a malformed shape (most
+    // commonly a locator-pick `{match_kind, idx, reasoning}` instead of an
+    // action-pick — observed during audplexus dogfood 2026-05-13), the
+    // provider throws on safeParse. Without this catch, the schema-validation
+    // error escapes runFlow and the entire flow lands `outcome="error"` for
+    // what is effectively a model decline. Treat schema rejection as no_match
+    // so the judge can decide give_up cleanly on its next iteration.
+    return {
+      performed: false,
+      action: undefined,
+      target: undefined,
+      reasoning: `AI returned non-action shape; treated as no_match. ${pickResult.message}`,
+    };
+  }
+  const pick = pickResult.value;
 
-  const pickConfidence = typeof pick.confidence === "number" ? pick.confidence : 70;
-  if (pick.idx < 0 || pick.idx >= outline.length) {
+  const pickConfidence =
+    typeof pick.confidence === "number" ? pick.confidence : 70;
+
+  if (pick.match_kind === "none") {
     return {
       performed: false,
       action: undefined,
@@ -200,6 +385,7 @@ export async function act(ctx: ActionContext, instruction: string): Promise<ActR
       reasoning: pick.reasoning,
     };
   }
+
   // Confidence gate: don't fire the action if the AI hedged. Same threshold
   // as observe() — low-confidence picks degrade to no_match so the judge
   // can decide give_up cleanly instead of acting on a guess.
@@ -211,7 +397,16 @@ export async function act(ctx: ActionContext, instruction: string): Promise<ActR
       reasoning: `low confidence (${pickConfidence}/100) — declined to act. ${pick.reasoning}`,
     };
   }
-  const target = outline[pick.idx]!;
+
+  const target = outline[pick.idx];
+  if (!target) {
+    return {
+      performed: false,
+      action: undefined,
+      target: undefined,
+      reasoning: `out-of-bounds idx ${pick.idx} (outline has ${outline.length} entries). ${pick.reasoning}`,
+    };
+  }
   const locator = buildLocator(ctx.page, target);
 
   try {
@@ -220,15 +415,12 @@ export async function act(ctx: ActionContext, instruction: string): Promise<ActR
         await locator.click({ timeout: 8000 });
         break;
       case "fill":
-        if (pick.value === undefined) throw new Error("fill requires value");
         await locator.fill(pick.value, { timeout: 8000 });
         break;
       case "press":
-        if (pick.value === undefined) throw new Error("press requires value (key)");
         await locator.press(pick.value, { timeout: 8000 });
         break;
       case "select":
-        if (pick.value === undefined) throw new Error("select requires value");
         await locator.selectOption(pick.value, { timeout: 8000 });
         break;
       case "scroll_to":

@@ -12,8 +12,18 @@ export const PersonaCandidateSchema = PersonaSchema.extend({
 });
 export type PersonaCandidate = z.infer<typeof PersonaCandidateSchema>;
 
-const CandidateSetSchema = z.object({
+// Initial generation expects a roster: at least 4 candidates so the operator
+// has a meaningful set to curate from.
+const CandidateBatchSchema = z.object({
   candidates: z.array(PersonaCandidateSchema).min(4).max(16),
+});
+
+// Single-slot regeneration (used by `curate` when the operator rejects a
+// candidate and wants a fresh proposal). The model is asked for exactly one
+// candidate and the schema must accept that — using the .min(4) batch schema
+// here was a documented-but-broken path that always tripped Zod.
+const CandidateSingleSchema = z.object({
+  candidates: z.array(PersonaCandidateSchema).min(1).max(16),
 });
 
 const SCHEMA_EXAMPLE = `{
@@ -88,9 +98,31 @@ export interface GenerateOptions {
   project: ProjectContext;
   templates: PersonaTemplate[];
   surfaces?: Surface[];
+  /**
+   * Total number of persona candidates to return. The underlying AI schema
+   * caps each call at 16; when count > 12 we batch internally and pass
+   * accumulating `existing` ids forward so the same persona isn't proposed
+   * twice. Pass any reasonable number — 30, 50, 100 — and the batch loop
+   * will keep going until either enough uniques arrive or two consecutive
+   * batches produce nothing new (a saturation signal).
+   */
   count?: number;
   existing?: string[];
+  /**
+   * Optional user-supplied directive. When set, the AI is told to bias the
+   * roster toward stress-testing the named area. Personas remain valid
+   * across the product, but the mix should over-index on stressing the
+   * focus area.
+   */
+  focus?: string;
 }
+
+// Per-batch cap to keep individual AI calls under the 16-element schema
+// ceiling with a small safety margin. When the user asks for count > this
+// value we loop and accumulate, treating two empty batches in a row as
+// saturation.
+const PERSONA_BATCH_SIZE = 12;
+const MAX_EMPTY_BATCHES = 2;
 
 function surfacesToPrompt(surfaces: Surface[]): string {
   return surfaces
@@ -110,31 +142,49 @@ function templatesToPrompt(templates: PersonaTemplate[]): string {
     .join("\n\n");
 }
 
-export async function generateCandidates(
+/**
+ * One AI call. Bounded by PERSONA_BATCH_SIZE so the response stays under the
+ * CandidateSetSchema cap. `targetCount` is the size the AI is asked to
+ * return, clamped at the batch cap. `existingIds` is the running dedupe set
+ * across batches (in batched mode).
+ */
+async function generateOneBatch(
   opts: GenerateOptions,
+  targetCount: number,
+  existingIds: Set<string>,
 ): Promise<PersonaCandidate[]> {
   const surfaces = opts.surfaces ?? [];
   const surfaceList = surfaces.length > 0 ? surfaces.map((s) => s.id).join(", ") : "(none)";
+  const focus = opts.focus?.trim();
+  const existingList = [...existingIds];
   const userPrompt = [
     `## Product context\n${summarizeProject(opts.project)}`,
     surfaces.length > 0 ? `## Surfaces (assign each persona to one)\n${surfacesToPrompt(surfaces)}` : "",
     `## Behavior templates available\n${templatesToPrompt(opts.templates)}`,
-    opts.existing && opts.existing.length > 0
-      ? `## Already-curated persona ids (do not duplicate)\n${opts.existing.join(", ")}`
+    focus
+      ? `## Focus directive (from operator)\nThe operator wants the persona roster to over-index on stress-testing: ${focus}\nDo NOT abandon the rest of the product — still propose some non-focus personas — but make sure several proposed personas would specifically exercise this area in their goals/behaviors. Their character + voice should remain realistic, not satirical.`
+      : "",
+    existingList.length > 0
+      ? `## Already-curated persona ids (do not duplicate; choose different roles/situations)\n${existingList.join(", ")}`
       : "",
     surfaces.length > 0
-      ? `## Task\nPropose ${opts.count ?? 10} persona candidates. Assign each to one of these surfaces: ${surfaceList}. Distribute across surfaces; do not put them all on one.`
-      : `## Task\nPropose ${opts.count ?? 10} persona candidates for this product. Mix core and edge as described.`,
+      ? `## Task\nPropose ${targetCount} persona candidates. Assign each to one of these surfaces: ${surfaceList}. Distribute across surfaces; do not put them all on one.`
+      : `## Task\nPropose ${targetCount} persona candidates for this product. Mix core and edge as described.`,
   ]
     .filter(Boolean)
     .join("\n\n");
+
+  // Pick the right schema for the ask. Single-slot regeneration (count=1)
+  // legitimately returns 1 candidate; using the batch schema (.min(4)) would
+  // make a correct response fail validation.
+  const schema = targetCount < 4 ? CandidateSingleSchema : CandidateBatchSchema;
 
   const result = await opts.provider.propose({
     messages: [
       { role: "system", content: SYSTEM_PROMPT },
       { role: "user", content: userPrompt },
     ],
-    schema: CandidateSetSchema,
+    schema,
     schemaName: "PersonaCandidateSet",
     schemaDescription:
       "Object with 'candidates' array. Each candidate has id, character{name,age,context,voice}, behavior{...}, label ('core'|'edge'), optional template_id, and rationale.",
@@ -142,14 +192,45 @@ export async function generateCandidates(
     temperature: 0.8,
   });
 
-  const seen = new Set(opts.existing ?? []);
-  const unique: typeof result.candidates = [];
+  const unique: PersonaCandidate[] = [];
   for (const c of result.candidates) {
-    if (seen.has(c.id)) continue;
-    seen.add(c.id);
-    unique.push(c);
+    if (existingIds.has(c.id)) continue;
+    existingIds.add(c.id);
+    unique.push(c as PersonaCandidate);
   }
-  return unique as PersonaCandidate[];
+  return unique;
+}
+
+export async function generateCandidates(
+  opts: GenerateOptions,
+): Promise<PersonaCandidate[]> {
+  const requested = opts.count ?? 10;
+  const seen = new Set<string>(opts.existing ?? []);
+
+  // Small ask — one call, schema cap (16) is enough.
+  if (requested <= PERSONA_BATCH_SIZE) {
+    return generateOneBatch(opts, requested, seen);
+  }
+
+  // Batched mode: keep generating until we have `requested` uniques or the
+  // model saturates (two empty batches in a row = it's run out of new
+  // ideas given the existing dedupe set + product context).
+  const out: PersonaCandidate[] = [];
+  let emptyBatches = 0;
+  while (out.length < requested && emptyBatches < MAX_EMPTY_BATCHES) {
+    const remaining = requested - out.length;
+    const ask = Math.min(remaining, PERSONA_BATCH_SIZE);
+    const batch = await generateOneBatch(opts, ask, seen);
+    if (batch.length === 0) {
+      emptyBatches += 1;
+      continue;
+    }
+    emptyBatches = 0;
+    out.push(...batch);
+  }
+  // If the model saturates before hitting `requested`, return what we got
+  // rather than failing — caller (curate) will continue with what's there.
+  return out.slice(0, requested);
 }
 
 export function candidateToPersona(c: PersonaCandidate): Persona {

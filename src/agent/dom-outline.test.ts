@@ -45,4 +45,23 @@ describe("summarizeOutline", () => {
     const out = summarizeOutline([long]);
     expect(out.length).toBeLessThan(150);
   });
+
+  test("summary disclosure widgets render as button entries", () => {
+    // <summary> elements are mapped to role="button" inside the outline
+    // script so the persona judge can see "How to find X" as an interactive
+    // affordance. We can't run the browser script here, but we can verify
+    // summarizeOutline accepts a button-role entry sourced from <summary>
+    // and renders the discoverable label.
+    const summaryAsButton: OutlineElement = {
+      idx: 0,
+      role: "button",
+      name: "How to find your library ID",
+      tag: "summary",
+      text: "",
+      href: null,
+      visible: true,
+    };
+    const out = summarizeOutline([summaryAsButton]);
+    expect(out).toContain('[0] button "How to find your library ID"');
+  });
 });

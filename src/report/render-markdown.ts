@@ -22,6 +22,18 @@ const VETTING_BADGE: Record<Finding["vetting"]["status"], string> = {
   regressed: "regressed (replay did not re-hit; likely stale)",
 };
 
+// Make the persona-abandonment classification visible in the report so a
+// reader can tell at a glance whether a finding is a real defect, polish
+// work, product-backlog signal, or noise. Bug = engineering defect;
+// confusing_ux = polish; feature_gap = product; not_a_bug = noise (already
+// down-severity'd by the generator).
+const CATEGORY_BADGE: Record<NonNullable<Finding["category"]>, string> = {
+  bug: "BUG",
+  confusing_ux: "confusing-ux",
+  feature_gap: "feature-gap",
+  not_a_bug: "not-a-bug",
+};
+
 function sortFindings(findings: Finding[]): Finding[] {
   return [...findings].sort((a, b) => {
     const s = SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity];
@@ -32,7 +44,8 @@ function sortFindings(findings: Finding[]): Finding[] {
 
 function renderFinding(f: Finding): string {
   const lines: string[] = [];
-  lines.push(`#### \`${f.id}\` [${SEVERITY_BADGE[f.severity]}] [${VETTING_BADGE[f.vetting.status]}] ${f.title}`);
+  const categoryBadge = f.category ? ` [${CATEGORY_BADGE[f.category]}]` : "";
+  lines.push(`#### \`${f.id}\` [${SEVERITY_BADGE[f.severity]}] [${VETTING_BADGE[f.vetting.status]}]${categoryBadge} ${f.title}`);
   lines.push("");
   lines.push(`- URL: ${f.url}`);
   if (f.flowId) lines.push(`- Flow: \`${f.flowId}\`${f.stepIndex !== undefined ? ` step ${f.stepIndex + 1}` : ""}`);

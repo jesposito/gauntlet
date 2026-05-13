@@ -64,6 +64,12 @@ export interface GenerateFlowsOptions {
   persona: Persona;
   surface?: Surface;
   count?: number;
+  /**
+   * Optional user-supplied directive. When set, the flows for this persona
+   * should over-index on attempting the named area. Persona's goals still
+   * lead — focus is a steering hint, not an override.
+   */
+  focus?: string;
 }
 
 function personaToPrompt(persona: Persona): string {
@@ -105,10 +111,14 @@ NOT available on this surface: ${opts.surface.excluded_features.join(", ") || "(
 DO NOT propose flows that reference features in "NOT available". The persona cannot find what isn't there.`
     : "";
 
+  const focus = opts.focus?.trim();
   const userPrompt = [
     `## Product context\n${summarizeProject(opts.project)}`,
     surfaceBlock,
     `## Persona\n${personaToPrompt(opts.persona)}`,
+    focus
+      ? `## Focus directive (from operator)\nThe operator wants extra coverage on: ${focus}\nWhere this persona's own goals plausibly intersect with the focus area, prefer a flow that exercises it. Do not invent flows the persona would never attempt just to hit the focus — persona realism wins ties.`
+      : "",
     `## Task\nPropose ${opts.count ?? 3} flows this persona would attempt on this surface.`,
   ]
     .filter(Boolean)

@@ -3,6 +3,7 @@ import {
   type Browser,
   type BrowserContext,
   type ConsoleMessage,
+  type LaunchOptions,
   type Page,
   type Request,
   type Response,
@@ -21,6 +22,43 @@ import { FailureReason, type FailureEvent } from "./failure-reasons.ts";
 import { matchAxeViolationsToPersonaRules } from "./axe-scan.ts";
 import { detectExternalHost } from "./external-host.ts";
 import { classifyConsoleMessage } from "./console-class.ts";
+
+/**
+ * Bounded close. Mirrors the discipline in flow-runner.ts: if Playwright
+ * hangs while releasing the context/browser we'd rather leak the OS process
+ * than block the entire run forever.
+ */
+const CLOSE_TIMEOUT_MS = 8_000;
+function closeWithTimeout(label: string, p: Promise<void>): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<void>((resolve) => {
+    timer = setTimeout(() => resolve(), CLOSE_TIMEOUT_MS);
+  });
+  return Promise.race([
+    p.catch((err) => {
+      // Surface unusual close errors but don't reject — the outer finally
+      // must continue closing the next resource.
+      // eslint-disable-next-line no-console
+      console.warn(`[gauntlet] ${label} threw during close: ${err instanceof Error ? err.message : String(err)}`);
+    }),
+    timeout,
+  ]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+/**
+ * Test seam. Production code uses the real Playwright `chromium`. Tests
+ * inject a stub launcher to assert resource discipline (close is invoked on
+ * exceptional paths) without spinning a real browser.
+ */
+export interface BrowserLauncher {
+  launch(opts: LaunchOptions): Promise<Browser>;
+}
+let _launcher: BrowserLauncher = chromium;
+export function _setBrowserLauncherForTesting(l: BrowserLauncher | undefined): void {
+  _launcher = l ?? chromium;
+}
 
 const DEVICE_USER_AGENTS: Record<string, string> = {
   desktop:
@@ -61,9 +99,17 @@ export async function runPersona(opts: RunOptions): Promise<RunResult> {
   const startedAt = Date.now();
   const failures: FailureEvent[] = [];
 
-  const browser: Browser = await chromium.launch({ headless });
+  // Resources held for the lifetime of this persona run. Declared outside
+  // the try so the outer finally can release them even if anything from
+  // page setup through capture/judge/writeFile throws. Mirrors the
+  // discipline in flow-runner.ts (do not modify that file — see CLAUDE.md).
+  let browser: Browser | undefined;
+  let context: BrowserContext | undefined;
+
+  try {
+  browser = await _launcher.launch({ headless });
   const ua = DEVICE_USER_AGENTS[persona.behavior.device] ?? DEVICE_USER_AGENTS.desktop!;
-  const context: BrowserContext = await browser.newContext({
+  context = await browser.newContext({
     viewport: persona.behavior.viewport,
     userAgent: ua,
     hasTouch:
@@ -248,9 +294,6 @@ export async function runPersona(opts: RunOptions): Promise<RunResult> {
     "utf8",
   );
 
-  await context.close();
-  await browser.close();
-
   return {
     persona,
     url,
@@ -260,4 +303,15 @@ export async function runPersona(opts: RunOptions): Promise<RunResult> {
     abandoned: false,
     durationMs: Date.now() - startedAt,
   };
+  } finally {
+    // Release Playwright resources even on exceptional paths (capture failure,
+    // disk full on writeFile, AI/CDP throw, etc). Bounded so a hung close
+    // doesn't wedge the run.
+    if (context) {
+      await closeWithTimeout("context.close", context.close());
+    }
+    if (browser) {
+      await closeWithTimeout("browser.close", browser.close());
+    }
+  }
 }
