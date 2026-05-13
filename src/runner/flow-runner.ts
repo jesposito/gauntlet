@@ -550,7 +550,10 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
           timestamp: Date.now(),
           stepIndex: i,
           url: page.url(),
-          metadata: { evidence: verdict.evidence },
+          metadata: {
+            evidence: verdict.evidence,
+            ...(verdict.give_up_class ? { giveUpClass: verdict.give_up_class } : {}),
+          },
         });
         outcome = "abandoned";
         outcomeReason = verdict.give_up_reason ?? "give_up";

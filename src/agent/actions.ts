@@ -3,6 +3,7 @@ import type { Locator, Page } from "playwright";
 import type { AiProvider } from "../ai/provider.ts";
 import {
   getOutline,
+  getPageText,
   summarizeOutline,
   type OutlineElement,
 } from "./dom-outline.ts";
@@ -112,15 +113,16 @@ export async function observe(
   instruction: string,
 ): Promise<ObserveResult> {
   const outline = await getOutline(ctx.page);
+  const pageText = await getPageText(ctx.page, 2000);
   const result = await ctx.provider.propose({
     messages: [
       {
         role: "system",
-        content: `You pick the best-matching page element from a numbered outline. Output ONLY JSON matching {"idx": number, "reasoning": string, "confidence": number}. idx is the element index, or -1 if nothing matches. confidence is 0-100 reflecting how certain you are: 90+ for unambiguous matches (exact name + role + clear semantic match), 60-89 when reasonably sure, <60 when guessing (callers will treat <60 as no_match).${voicePreamble(ctx.personaVoice)}`,
+        content: `You pick the best-matching page element from a numbered outline. Output ONLY JSON matching {"idx": number, "reasoning": string, "confidence": number}. idx is the element index, or -1 if nothing matches. confidence is 0-100 reflecting how certain you are: 90+ for unambiguous matches (exact name + role + clear semantic match), 60-89 when reasonably sure, <60 when guessing (callers will treat <60 as no_match). Notes: a <summary> entry in the outline is a collapsed disclosure widget (native <details>) — if the persona is looking for help text or instructions and a relevant <summary> label is present, treat that as a match. The page-text snippet supplements the outline for content the outline cannot represent (stat cards, status banners, empty-state text); if the persona's target is purely textual ("count of failed jobs"), a match in the text snippet is still a successful observation — return idx=-1 with high confidence and call out the text-snippet hit in reasoning so the caller does not treat it as a missing affordance.${voicePreamble(ctx.personaVoice)}`,
       },
       {
         role: "user",
-        content: `Outline of visible interactive elements on this page:\n${summarizeOutline(outline)}\n\nInstruction: "${instruction}"\n\nReturn the matching idx, or -1 if no element matches.${recentStepsPreamble(ctx.recentSteps)}`,
+        content: `Outline of visible interactive elements on this page:\n${summarizeOutline(outline)}\n\nPage-text snippet (supplemental, for content not in the outline):\n${pageText || "(no body text captured)"}\n\nInstruction: "${instruction}"\n\nReturn the matching idx, or -1 if no element matches.${recentStepsPreamble(ctx.recentSteps)}`,
       },
     ],
     schema: LocatorPickSchema,

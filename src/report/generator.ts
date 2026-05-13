@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { FailureReason, type FailureEvent } from "../runner/failure-reasons.ts";
 import {
   type Finding,
+  type FindingCategory,
   type PersonaReport,
   type Severity,
   type ReplayStrategy,
@@ -187,6 +188,21 @@ export async function buildPersonaReport(
       if (isThirdPartyAxe) {
         severity = "minor";
       }
+      // Persona-abandonment category, set by the step judge. Tells us the
+      // judge's read on whether the abandonment was a real defect or noise.
+      const giveUpClass =
+        typeof failure.metadata?.giveUpClass === "string"
+          ? (failure.metadata.giveUpClass as FindingCategory)
+          : undefined;
+      // not_a_bug = persona was wrong; persona-mismatch noise. Floor it to
+      // minor so it doesn't compete with real findings in the dashboard but
+      // remains in the artifact for transparency. feature_gap is product
+      // backlog, not an engineering defect — also minor. confusing_ux stays
+      // at its base severity (typically serious) because hidden affordances
+      // are real friction even if the underlying capability exists.
+      if (giveUpClass === "not_a_bug" || giveUpClass === "feature_gap") {
+        severity = "minor";
+      }
 
       // For axe findings, dedup across steps (same rule + url = same bug).
       // For other failures, key on step to keep distinct occurrences.
@@ -229,6 +245,7 @@ export async function buildPersonaReport(
         ...(result.surface ? { surfaceId: result.surface } : {}),
         reason: failure.reason,
         severity,
+        ...(giveUpClass ? { category: giveUpClass } : {}),
         title,
         detail: failure.message,
         ...(axeId !== undefined ? { axeRuleId: axeId } : {}),
