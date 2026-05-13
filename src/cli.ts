@@ -766,6 +766,10 @@ async function cmdInit(args: ParsedArgs): Promise<void> {
   const model =
     typeof args.flags.model === "string" ? args.flags.model : DEFAULT_MODEL;
   const requested = args.flags.count ? Number(args.flags.count) : 10;
+  // Operator-supplied "what should the testers focus on?" directive. Flows
+  // forward into surface / persona / flow generation so the AI weights
+  // discovery toward this area. Empty / unset = no directive.
+  const focus = typeof args.flags.focus === "string" ? args.flags.focus.trim() : "";
   const cacheEnabled = args.flags["no-cache"] !== true;
   const probeEnabled = args.flags["no-probe"] !== true && urls.length > 0;
   // Stage isolation flags. Default: run both phases.
@@ -827,7 +831,11 @@ async function cmdInit(args: ParsedArgs): Promise<void> {
     );
   } else if (surfaces.length === 0 || refreshSurfaces) {
     console.log("\n[Phase A2] AI proposing surfaces from landings + README...");
-    const proposed = await generateSurfaces({ provider, project });
+    const proposed = await generateSurfaces({
+      provider,
+      project,
+      ...(focus ? { focus } : {}),
+    });
     console.log(`  ${proposed.length} surface${proposed.length === 1 ? "" : "s"} proposed`);
     for (const s of proposed) {
       const auth = s.requires_auth ? " (requires_auth)" : "";
@@ -894,6 +902,7 @@ async function cmdInit(args: ParsedArgs): Promise<void> {
     count: requested,
     existing: existingIds,
     ...(narrowSurfaces.length > 0 ? { surfaces: narrowSurfaces } : {}),
+    ...(focus ? { focus } : {}),
   });
   console.log(`  got ${candidates.length} unique candidates.`);
 
@@ -908,6 +917,7 @@ async function cmdInit(args: ParsedArgs): Promise<void> {
         count: 1,
         existing: [...existingIds, ...result.accepted.map((p) => p.id)],
         ...(narrowSurfaces.length > 0 ? { surfaces: narrowSurfaces } : {}),
+        ...(focus ? { focus } : {}),
       });
       return fresh[0];
     },
@@ -932,6 +942,7 @@ async function cmdFlows(args: ParsedArgs): Promise<void> {
     typeof args.flags.model === "string" ? args.flags.model : DEFAULT_MODEL;
   const url = typeof args.flags.url === "string" ? args.flags.url : undefined;
   const count = args.flags.count ? Number(args.flags.count) : 3;
+  const focus = typeof args.flags.focus === "string" ? args.flags.focus.trim() : "";
   const cacheEnabled = args.flags["no-cache"] !== true;
   const replaceFlag = args.flags.replace === true;
   // Narrow flows generation to personas on one surface.
@@ -1032,6 +1043,7 @@ async function cmdFlows(args: ParsedArgs): Promise<void> {
     console.log(`\n[Phase C] ${persona.id} (${persona.character.name})${surfaceTag}`);
     const flowOpts: Parameters<typeof generateFlows>[0] = { provider, project, persona, count };
     if (surface) flowOpts.surface = surface;
+    if (focus) flowOpts.focus = focus;
     const flows = await generateFlows(flowOpts);
     console.log(`  AI proposed ${flows.length} flow${flows.length === 1 ? "" : "s"}`);
 
@@ -1063,9 +1075,11 @@ function cmdHelp(): void {
 usage:
   gauntlet init [--url <urls>] [--skip-surfaces | --refresh-surfaces]
                 [--skip-personas] [--surface <id>] [--replace-personas]
-                [--model <id>] [--count N] [--no-cache] [--no-probe]
+                [--model <id>] [--count N] [--focus <text>]
+                [--no-cache] [--no-probe]
   gauntlet flows [--personas <ids>] [--surface <id>] [--replace]
-                 [--model <id>] [--count N] [--url <url>] [--no-cache]
+                 [--model <id>] [--count N] [--focus <text>]
+                 [--url <url>] [--no-cache]
   gauntlet run [<url> | --url <url> | --surface <id> | --pr <num>]
                [--personas <id[,id...]>]
                [--flows <id[,id...]>] [--features <name[,...]>]
@@ -1105,7 +1119,16 @@ init flags (stage isolation):
 
 init flags (misc):
   --model <id>          AI model for persona generation (default ${DEFAULT_MODEL})
-  --count <n>           candidate count to request from AI (default 10)
+  --count <n>           candidate count to request from AI (default 10).
+                        Values >12 are batched internally with dedupe so you
+                        can ask for 30, 50, etc. without hitting the
+                        per-call schema cap.
+  --focus <text>        steer surface + persona + flow discovery toward a
+                        specific area, e.g. \`--focus "the destinations form
+                        and post-error recovery"\`. Personas/flows still
+                        cover the rest of the product, but several extra
+                        candidates will be biased toward stressing this
+                        area. Quote multi-word values.
   --no-cache            disable AI response cache (default: cache on)
 
 auth flags:
@@ -1120,6 +1143,9 @@ flows flags:
                         regen (default: append to the curated set)
   --model <id>          AI model for flow generation (default ${DEFAULT_MODEL})
   --count <n>           flows per persona to propose (default 3)
+  --focus <text>        steer flows toward a specific area where the
+                        persona's goals plausibly intersect with it.
+                        Persona realism still wins ties.
   --url <url>           landing page to include in product context (optional)
   --no-cache            disable AI response cache
 

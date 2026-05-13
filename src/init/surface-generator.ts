@@ -75,13 +75,25 @@ ${SCHEMA_EXAMPLE}`;
 export interface GenerateSurfacesOptions {
   provider: AiProvider;
   project: ProjectContext;
+  /**
+   * Optional user-supplied directive. When set, the AI is told to weight
+   * surface discovery toward the named area without ignoring the rest of
+   * the product. Empty string = no directive (same as undefined).
+   */
+  focus?: string;
 }
 
 export async function generateSurfaces(opts: GenerateSurfacesOptions): Promise<Surface[]> {
+  const focus = opts.focus?.trim();
   const userPrompt = [
     `## Product context\n${summarizeProject(opts.project)}`,
+    focus
+      ? `## Focus directive (from operator)\nThe operator wants extra attention paid to: ${focus}\nIdentify all surfaces, but make sure any surface that touches this area is captured cleanly (its own surface entry, not folded into a generic "app" surface).`
+      : "",
     `## Task\nIdentify the distinct user-facing surfaces of this product. Return all of them.`,
-  ].join("\n\n");
+  ]
+    .filter(Boolean)
+    .join("\n\n");
 
   const result = await opts.provider.propose({
     messages: [
