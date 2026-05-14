@@ -2,6 +2,10 @@ import { z } from "zod";
 import type { AiProvider } from "../ai/provider.ts";
 import { SurfaceSchema, type Surface } from "../surface/schema.ts";
 import { type ProjectContext, summarizeProject } from "./project-reader.ts";
+import {
+  INIT_AI_TIMEOUT_MS,
+  withCancellableTimeout,
+} from "../ai/with-cancellable-timeout.ts";
 
 const SurfaceSetSchema = z.object({
   surfaces: z.array(SurfaceSchema).min(1).max(8),
@@ -81,6 +85,12 @@ export interface GenerateSurfacesOptions {
    * the product. Empty string = no directive (same as undefined).
    */
   focus?: string;
+  /**
+   * Per-AI-call timeout in ms. Defaults to INIT_AI_TIMEOUT_MS (120s).
+   * Test-only seam — production code should not pass this. On timeout
+   * the underlying provider fetch is aborted and the call rejects.
+   */
+  timeoutMs?: number;
 }
 
 export async function generateSurfaces(opts: GenerateSurfacesOptions): Promise<Surface[]> {
@@ -95,19 +105,26 @@ export async function generateSurfaces(opts: GenerateSurfacesOptions): Promise<S
     .filter(Boolean)
     .join("\n\n");
 
-  const result = await opts.provider.propose({
-    messages: [
-      { role: "system", content: SYSTEM_PROMPT },
-      { role: "user", content: userPrompt },
-    ],
-    schema: SurfaceSetSchema,
-    schemaName: "SurfaceSet",
-    schemaDescription:
-      "Object with 'surfaces' array. Each surface has id, name, base_url?, audience, features[], excluded_features[].",
-    maxTokens: 4000,
-    temperature: 0.6,
-    purpose: "surface_gen",
-  });
+  const timeoutMs = opts.timeoutMs ?? INIT_AI_TIMEOUT_MS;
+  const result = await withCancellableTimeout(
+    (signal) =>
+      opts.provider.propose({
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          { role: "user", content: userPrompt },
+        ],
+        schema: SurfaceSetSchema,
+        schemaName: "SurfaceSet",
+        schemaDescription:
+          "Object with 'surfaces' array. Each surface has id, name, base_url?, audience, features[], excluded_features[].",
+        maxTokens: 4000,
+        temperature: 0.6,
+        purpose: "surface_gen",
+        signal,
+      }),
+    timeoutMs,
+    "init AI call surface_gen",
+  );
 
   return result.surfaces as Surface[];
 }

@@ -4,6 +4,10 @@ import { PersonaSchema, type Persona } from "../persona/schema.ts";
 import type { PersonaTemplate } from "../persona/templates.ts";
 import { type ProjectContext, summarizeProject } from "./project-reader.ts";
 import type { Surface } from "../surface/schema.ts";
+import {
+  INIT_AI_TIMEOUT_MS,
+  withCancellableTimeout,
+} from "../ai/with-cancellable-timeout.ts";
 
 export const PersonaCandidateSchema = PersonaSchema.extend({
   label: z.enum(["core", "edge"]),
@@ -115,6 +119,13 @@ export interface GenerateOptions {
    * focus area.
    */
   focus?: string;
+  /**
+   * Per-AI-call timeout in ms. Defaults to INIT_AI_TIMEOUT_MS (120s).
+   * Test-only seam — production code should not pass this. Applies to
+   * each underlying batch call (the batched path may issue multiple
+   * propose() calls; each is independently bounded).
+   */
+  timeoutMs?: number;
 }
 
 // Per-batch cap to keep individual AI calls under the 16-element schema
@@ -179,19 +190,26 @@ async function generateOneBatch(
   // make a correct response fail validation.
   const schema = targetCount < 4 ? CandidateSingleSchema : CandidateBatchSchema;
 
-  const result = await opts.provider.propose({
-    messages: [
-      { role: "system", content: SYSTEM_PROMPT },
-      { role: "user", content: userPrompt },
-    ],
-    schema,
-    schemaName: "PersonaCandidateSet",
-    schemaDescription:
-      "Object with 'candidates' array. Each candidate has id, character{name,age,context,voice}, behavior{...}, label ('core'|'edge'), optional template_id, and rationale.",
-    maxTokens: 8000,
-    temperature: 0.8,
-    purpose: "persona_gen",
-  });
+  const timeoutMs = opts.timeoutMs ?? INIT_AI_TIMEOUT_MS;
+  const result = await withCancellableTimeout(
+    (signal) =>
+      opts.provider.propose({
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          { role: "user", content: userPrompt },
+        ],
+        schema,
+        schemaName: "PersonaCandidateSet",
+        schemaDescription:
+          "Object with 'candidates' array. Each candidate has id, character{name,age,context,voice}, behavior{...}, label ('core'|'edge'), optional template_id, and rationale.",
+        maxTokens: 8000,
+        temperature: 0.8,
+        purpose: "persona_gen",
+        signal,
+      }),
+    timeoutMs,
+    "init AI call persona_gen",
+  );
 
   const unique: PersonaCandidate[] = [];
   for (const c of result.candidates) {
