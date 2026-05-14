@@ -10,9 +10,15 @@ Self-hosted. MIT. Bring your own AI key.
 bun install && bunx playwright install chromium
 export ANTHROPIC_API_KEY=sk-ant-...
 bun run src/cli.ts init --url https://your-app.com
-bun run src/cli.ts run --surface marketing
+bun run src/cli.ts run --surface marketing --events-log run.jsonl
 bun run src/cli.ts report
 ```
+
+`--events-log` streams every `GauntletEvent` (phase boundaries, AI calls,
+vetter heartbeat, setup ops) as JSONL — tail it from another shell or
+let an agent (Claude, CI) follow along. Add `--record-video` if you want
+Playwright WebM captures (off by default; ffmpeg has no internal close
+deadline so video stays opt-in).
 
 ---
 
@@ -195,7 +201,8 @@ gauntlet help
 gauntlet init [--url <urls>]
               [--skip-surfaces | --refresh-surfaces]
               [--skip-personas] [--surface <id>] [--replace-personas]
-              [--model <id>] [--count N]
+              [--focus <text>] [--model <id>] [--count N]
+              [--events-log <path>] [--no-color]
               [--no-cache] [--no-probe]
 ```
 
@@ -206,17 +213,27 @@ gauntlet init [--url <urls>]
 - `--surface <id>` narrows persona generation to one surface (for under-served audiences).
 - `--replace-personas` drops existing curated personas before regen (scoped by `--surface` when set).
 - `--model` picks the AI provider from the prefix; see [AI providers](#ai-providers).
+- `--focus <text>` over-indexes surface / persona / flow generation on
+  a named area (e.g. `--focus "the destinations form and post-error
+  recovery"`) without dropping coverage of the rest of the product.
+- `--count N` batches past the per-call schema cap of 16. Asking for
+  30 personas now yields 30 unique personas via several batched calls
+  with saturation cutoff (two empty batches end the loop early).
 
 ### `gauntlet flows`
 
 ```
 gauntlet flows [--personas <ids>] [--surface <id>] [--replace]
-               [--model <id>] [--count N] [--url <url>] [--no-cache]
+               [--focus <text>] [--model <id>] [--count N] [--url <url>]
+               [--events-log <path>] [--no-color] [--no-cache]
 ```
 
 - `--personas` is comma-separated. Defaults to every curated persona.
 - `--surface <id>` filters personas to those on one surface.
 - `--replace` drops existing flows for the selected personas before regen.
+- `--focus <text>` is the same directive as on `init`: weighted
+  emphasis on a named area while still covering the rest of the
+  surface.
 
 ### `gauntlet run`
 
@@ -227,6 +244,8 @@ gauntlet run [<url> | --url <url> | --surface <id> | --pr <num>]
              [--tags <tags>] [--exclude-tags <tags>] [--paths <paths>]
              [--steps <n>] [--headed] [--model <id>]
              [--concurrency <n>] [--quiet]
+             [--events-log <path>] [--no-color]
+             [--record-video] [--no-supervisor]
              [--no-cache] [--no-flows] [--no-report]
 ```
 
@@ -237,6 +256,19 @@ Target sources (combinable):
 - `--pr <num>` — resolves the preview URL via `.gauntlet/config.json` `pr_url_template` (substitutes `{number}`, `{pr}`, `{branch}`, `{ref}`; slugs the branch for URL safety) or, failing that, scans PR comments for Vercel / Netlify / Render / Cloudflare Pages / Fly preview-URL patterns.
 
 Filters (all compose with `AND`; `--tags` is `OR` within group):
+
+Observability flags (work on `run`, `report`, `init`, `flows`, `seed`):
+
+- `--events-log <path>` — append every event as JSONL. One event per
+  line, every line carries `ts`. Use it to tail-follow a long run from
+  a second shell or let an agent / CI consume the stream.
+- `--no-color` — disable ANSI color in the text renderer (`NO_COLOR`
+  env var honored too).
+- `--record-video` (run only) — opt-in Playwright WebM recording.
+  Defaults off; the artifacts the report uses don't depend on video.
+- `--no-supervisor` (run only) — fall back to in-process flow
+  execution. Default is the per-flow worker process supervisor (see
+  [Reliability](#reliability)).
 
 ```bash
 # Marketing site, one persona, one specific flow.
@@ -343,7 +375,11 @@ The runner is built for unpredictable real-world pages. Borrowed from prior art 
 - **Per-step timeouts with AbortSignal cancellation.** Each `observe / act / judge` AI call has a 60s cap; on timeout the AbortController fires and the fetch is actually cancelled (not just abandoned). One automatic retry per op for transient 5xx.
 - **Mutation-observer page settle.** Replaces `networkidle` (which never fires on SPAs that poll). Waits for N ms of zero DOM mutations, capped by a hard timeout.
 - **Wallclock alarm.** A `setTimeout` fires `FLOW_WALLCLOCK_BUDGET_MS` after browser launch and force-closes the browser, no matter what the loop is doing. Catches Playwright primitives that ignore AbortSignal (e.g. `scrollIntoViewIfNeeded` retry loops).
+- **Per-flow worker process + silence watchdog.** Default execution model. Each flow runs as a detached subprocess (`src/runner/flow-worker.ts`); the parent (`src/runner/flow-supervisor.ts`) demuxes events on stdout and runs a 5s watchdog. If no event arrives for 75s the parent SIGTERMs the worker's process group and SIGKILLs after a 2s grace — reaping worker + chromium + any rogue ffmpeg in one shot. Survived a 12-minute production wedge against a marketing site that motivated the design. Flip back with `--no-supervisor` for in-process debugging.
 - **Per-flow exception isolation.** A crash in one flow writes a synthetic `outcome=error` flow-result and continues. The pool slot frees, the other personas keep running.
+- **Setup-op narration with bounded wallclocks.** `chromium.launch` (45s), `newContext` (30s), `newPage` (30s), CDP session (15s), network emulate (10s), `goto` (60s) are each wrapped and report `setup browser_launch  done  0.1s` to the renderer. Silent setup hangs surface in their op-budget instead of waiting for the 5-minute flow alarm.
+- **Vetter heartbeat.** Every per-finding axe scan emits start/end events; the renderer prints a spinner during the scan + a completion summary at end of vet. Eliminates the "appears to do nothing for 25 minutes" failure mode.
+- **AI-call visibility.** Every `provider.propose()` is wrapped with `ai_call_start` / `ai_call_end` and surfaced as `AI live 3.1s` or `AI cache 0.2s` in the terminal. Every long await is either bounded, cancellable, or both.
 - **Network-aware Playwright defaults.** `slow-3g` personas get selector/navigation timeouts up to 90s instead of the unscaled 30s.
 
 ---
@@ -371,6 +407,9 @@ src/
   ai/
     provider.ts                # Interface + caching decorator. ProposeOptions includes signal.
     cache.ts                   # sha256-keyed disk cache with hit/miss stats.
+    with-cancellable-timeout.ts # Shared helper: wraps an AI propose() in
+                                # an AbortController so timeouts cancel
+                                # the in-flight fetch (used by init too).
     anthropic.ts, openai.ts, google.ts, ollama.ts
   init/
     project-reader.ts          # Phase A. Multi-URL landings[]. Login-wall detection.
@@ -394,8 +433,22 @@ src/
     capture.ts                 # Headed login → storageState dump (mode 0600).
   target/
     pr.ts                      # --pr resolution: gh API + comment scan + URL validation.
+  events.ts                    # GauntletEvent discriminated union: phase /
+                               # ai_call / vet / setup_op / flow / heartbeat
+                               # / warn / error. Single source of truth for
+                               # both renderers.
+  renderers/
+    text.ts                    # Terminal renderer with ANSI spinner +
+                               # heartbeat. Per-persona color + shortname.
+                               # Drops ANSI on non-TTY (CI / piped).
+    jsonl.ts                   # One event per line for agent / CI tailing.
   runner/
     flow-runner.ts             # Phase D. observe→act→capture→judge per step.
+    flow-worker.ts             # Subprocess entry point for one flow. Writes
+                               # every event as one JSON line to stdout.
+    flow-supervisor.ts         # Parent-side: spawns worker detached (own
+                               # process group), 5s watchdog SIGKILLs the
+                               # group on >75s silence, demuxes events.
     browser.ts                 # Legacy single-step capture (pre-flows).
     step-judge.ts              # AI verdict (strict: requires observable evidence).
     capture.ts                 # Forensic snapshot: screenshot/DOM/AX-tree/axe/console/network.

@@ -4,7 +4,187 @@ All notable changes to Gauntlet are documented in this file.
 
 The format roughly follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## Latest highlights (Unreleased)
+## Unreleased — 2026-05-14 instrumentation + safety pass
+
+Five PRs merged today (#6 supersedes the unmerged #5; both rolled into one
+commit). The story: a 12-minute production wedge against a marketing site
+and a 25-minute vetter hang on a real customer admin run exposed the
+gap between "we have timeouts" and "the work actually stops." Every
+unbounded `await` in the codebase is now bounded, narrated, or both.
+
+### Added
+
+- **`--events-log <path>`** on every long-running command (`run`, `report`,
+  `init`, `flows`, `seed`). Appends every `GauntletEvent` as JSONL — one
+  event per line, every line carries `ts`. For Claude (or any agent / CI)
+  to tail a file as gauntlet runs.
+- **`--no-color`** on the same five commands. Disables ANSI in the text
+  renderer; `NO_COLOR` env var honored too.
+- **`--record-video`** on `run`. Opt-in Playwright WebM recording.
+  **Default OFF** — Playwright's ffmpeg `gracefulClose()` has no internal
+  deadline and ffmpeg is launched from our Bun process, so a hung video
+  worker can outlive `browser.close()`. The artifacts the report uses
+  (screenshots, axe, AX-tree, DOM, console, network, `flow-result.json`)
+  do not depend on video.
+- **`--no-supervisor`** on `run`. Falls back to in-process `runFlow` for
+  debugging. Default is the new per-flow worker process supervisor.
+- **`--focus <text>`** on `init` and `flows`. Threaded into surface /
+  persona / flow generators so the AI over-indexes on a named area
+  ("the destinations form and post-error recovery") without abandoning
+  the rest of the product.
+- **`--count N`** batching on `init` and `flows`. The per-call schema cap
+  is 16; counts above 12 now batch internally with saturation cutoff
+  (two consecutive empty batches end the loop). Asking for 30 personas
+  produces 30 unique personas instead of silently capping at 16.
+- **GauntletEvent stream** (`src/events.ts`) — discriminated union covering
+  `phase_start` / `phase_end`, `ai_call_start` / `ai_call_end`,
+  `vet_*` lifecycle events, `setup_op_start` / `setup_op_end`,
+  `flow_*`, `heartbeat`, `warn`, `error`. Single source of truth that
+  text + JSONL renderers consume independently.
+- **Per-phase headers** in the text renderer: `[Phase init]`, `[Phase
+  flows]`, `[Phase run]`, `[Phase vet]`, `[Phase report]` fire as the run
+  proceeds.
+- **Vetter heartbeat.** Every per-finding axe scan emits start/end events;
+  the renderer prints a spinner during the scan + a completion summary
+  at end of vet (counts of verified / regressed / could_not_replay /
+  subjective). Eliminates the "appears to do nothing for 25 minutes"
+  failure mode.
+- **AI-call visibility.** `CachingProvider.propose` wraps every call with
+  `ai_call_start` / `ai_call_end` (correlated by `callId`, `cached:
+  true|false`). Surfaced in the terminal as `AI live 3.1s` or `AI cache
+  0.2s`. Six production sites tagged with `purpose`: `surface_gen`,
+  `persona_gen`, `flow_gen`, `observe`, `act`, `judge`.
+- **Setup-op narration.** Every `chromium.launch` / `newContext` /
+  `newPage` / CDP session / network emulate / `goto` reports `setup
+  browser_launch  done  0.1s`. Per-op wallclocks: launch 45s, context/
+  page 30s, CDP 15s, network emulate 10s, goto 60s. Silent setup hangs
+  surface in `<op-budget>s` instead of waiting for the 5-minute flow
+  alarm.
+- **Per-flow worker process + silence watchdog.** `src/runner/flow-
+  worker.ts` is a subprocess entry point that runs one flow and writes
+  every event as one JSON line on stdout. `src/runner/flow-supervisor.ts`
+  spawns the worker `detached: true` (own POSIX process group), demuxes
+  events, and runs a 5-second watchdog: if no event arrives within
+  `silenceBudgetMs` (default 75s) the parent SIGTERMs the worker's
+  process group and SIGKILLs after a 2s grace. Reaps worker + chromium
+  + any rogue ffmpeg in one shot. Default execution model for `run`;
+  flip back with `--no-supervisor`.
+- **Per-flow shared `withCancellableTimeout` helper** at
+  `src/ai/with-cancellable-timeout.ts` so init AI calls reuse the same
+  pattern as the runner.
+
+### Changed
+
+- **Discriminated-union schemas for runner contracts.**
+  - `LocatorPickSchema` is now keyed on `match_kind: "element" | "text" |
+    "none"`. Text-only observation no longer wired as failure — it
+    short-circuits to a synthetic success verdict and proceeds.
+  - `ActionPickSchema` keyed on `action`; `value` required only on
+    `fill` / `press` / `select`. Impossible LLM outputs fail at the
+    schema boundary, not as runtime "action failed" pollution.
+  - `StepVerdictSchema` is a discriminated union; `give_up` requires
+    both `give_up_reason` and `give_up_class`. Permissive
+    `RawStepVerdictSchema` parses provider-sloppy AI output (now also
+    accepts explicit `null` on the optional fields, not just `undefined`)
+    and `normalizeVerdict` promotes to the strict shape.
+  - Observe `match_kind: "none"` give-ups are categorized into
+    `bug | confusing_ux | feature_gap | not_a_bug`. `not_a_bug` and
+    `feature_gap` auto-downgrade severity to `minor` so persona-
+    expectation mismatch stops drowning real defects.
+- **CLI numeric flags are strict.** `src/cli/flag-parsers.ts` rejects
+  NaN, negatives, zero, decimals, scientific notation, and over-cap
+  values at startup with named errors. Replaces 8 `Number(...)` parse
+  call-sites.
+- **Bad flow / surface YAML surfaces structured diagnostics** —
+  `warn: skipping <path>: <reason>` with field path. CLI hard-fails
+  when `--flows <id>` targets a broken artifact instead of silently
+  finding nothing.
+- **Persisted JSON read with schemas.** `src/report/io.ts` provides
+  `readFlowResultOrWarn` / `readRunReportOrWarn`; corrupt single
+  artifact warns and skips, doesn't fail an N-flow report.
+- **Persona shortname** (text renderer) takes the LAST kebab segment by
+  default ("prospect", "creator") — most distinctive descriptor in this
+  codebase's persona naming. Falls through to last-2 / last-3 / full id
+  on collision. Concurrent personas also get distinct ANSI colors.
+- **Outline + text snippet for observe / judge.** `<summary>` elements
+  are now in the dom outline; `getPageText()` supplies a compressed
+  innerText snippet alongside the role-based outline so the persona can
+  see stat-card content and disclosure copy that the role-only outline
+  hides.
+
+### Fixed
+
+- **Vetter no longer hangs after axe completes.** `closeSession`'s
+  `context.close()` and `browser.close()` are wrapped with an 8s
+  swallow-on-timeout so an orphaned context (parent chromium gone)
+  can't freeze the post-`vetAll` close path.
+- **Vetter heartbeat actually reaches users in production.** `cmdRun`
+  and `cmdReport` now thread `emit` through `buildReport`. The
+  morning's instrumentation PR shipped with tests passing because the
+  tests passed `emit` directly; production runs dropped it.
+- **`AxeBuilder.analyze()` raced against a 30s timeout** as a defensive
+  cap. Honest about the limit: axe injects an in-page runtime with no
+  public abort API, so the supervisor remains the actual reaper for a
+  hung axe pass.
+- **Schema-rejected AI output degraded to no-match** instead of throwing.
+  `proposeActionWithRecovery` catches Zod-rejection (detected via the
+  literal `"output failed schema"` substring all four providers emit)
+  and returns a tagged `no_match` outcome. Non-schema errors still
+  propagate.
+- **`ensureGiveUpClass` band-aid removed** — the discriminated
+  `RawStepVerdictSchema` + `normalizeVerdict` path now does the same
+  job at the schema layer. Default missing `give_up_class` to `"bug"`.
+- **Wallclock alarm outcome survives forced close.** `classifyFlowError`
+  pure helper owns the wallclock-vs-error decision; outer try/catch
+  reclassifies alarm-induced rejections to `outcome: "timeout"`;
+  `flow-result.json` written after outcome normalization (no race
+  where in-memory and on-disk disagreed).
+- **Init AI calls bounded.** Every `src/init/*-generator.ts` `propose()`
+  now wrapped in `withCancellableTimeout` (default 120s). Pre-fix:
+  `gauntlet init` could wedge indefinitely on a stuck AI call.
+- **Capture inner-bounded.** `page.content` / CDP `Accessibility.*` /
+  `page.title` each wrapped with sentinel-on-timeout (5s). `captureStep`
+  stays best-effort; partial capture beats a hang.
+- **Cross-surface and auth close paths bounded.** Every close in
+  `src/report/cross-surface.ts`, `src/auth/capture.ts`, and
+  `src/report/vetter.ts` is now wrapped in 8s `closeWithTimeout` /
+  `raceWithTimeout` with the same swallow-on-timeout discipline as
+  `src/runner/browser.ts`. Trade-off: a timed-out close may leak an OS
+  handle, strictly better than a frozen process.
+- **Persona regenerate path no longer schema-broken.** Split into
+  `CandidateBatchSchema` (`>=4`) for initial generation and
+  `CandidateSingleSchema` (`>=1`) for regenerate.
+- **`runPersona()` releases Chromium on exception.** Mirrors the
+  flow-runner discipline; `BrowserLauncher` test seam added.
+
+### Notes on architecture
+
+- `src/events.ts` is the new contract between runner / vetter / init /
+  AI provider and the two renderers (`src/renderers/text.ts`,
+  `src/renderers/jsonl.ts`). The renderers are independent — `text`
+  drives the TTY spinner and color; `jsonl` is for tail-and-parse.
+- `src/runner/flow-supervisor.ts` is the new default execution path for
+  `gauntlet run`. It runs `src/runner/flow-worker.ts` as a detached
+  subprocess and watchdog-kills the entire process group on silence.
+  In-process `runFlow` is still available via `--no-supervisor` for
+  debugging.
+- `setGlobalEventEmitter` is a process-wide singleton. Under
+  `--no-supervisor` with concurrency > 1, AI-call events from
+  concurrent flows interleave with no per-flow correlation. The
+  supervised path eliminates this by accident: each flow has its own
+  process.
+- Test seams introduced this cycle: `BrowserLauncher` (mirrors
+  `src/runner/browser.ts`) for vetter / cross-surface / auth so close-
+  side resource discipline can be proved without spawning a real
+  browser; `axeRunner` for vetter; `timeoutMs` on each init generator's
+  options.
+
+Test suite: 226 → **275 (+49)** across this cycle. `bun run tsc --noEmit`
+clean.
+
+---
+
+## Latest highlights (prior cycle — Unreleased)
 
 Building on the v0.1.0 baseline (the six-phase pipeline + persona library + Playwright runner + vetting layer), this cycle added everything required to take Gauntlet from "scaffold" to "real tool teams can adopt."
 
