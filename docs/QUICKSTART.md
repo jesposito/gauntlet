@@ -112,8 +112,13 @@ rationale: This flow exercises pricing clarity end-to-end with a hostile reader.
 ## Step 3 — Run gauntlet
 
 ```bash
-bun run src/cli.ts run --surface marketing
+bun run src/cli.ts run --surface marketing --events-log run.jsonl
 ```
+
+`--events-log` is optional but useful: every event (phase boundary, AI
+call, vetter heartbeat, setup op) is appended to `run.jsonl` as one
+JSON line so you can `tail -f run.jsonl` from a second shell or feed
+it to an agent / CI consumer.
 
 Sample output:
 
@@ -124,12 +129,16 @@ personas: indie-dev-considering-linear, mobile-commute-prospect
 run dir: .gauntlet/runs/2026-05-13T14-32-08-991Z
 concurrency: 2
 
+[Phase run]
 [indie-dev-considering-linear] Sasha Chen -> https://linear.app (3 flows)
+  setup browser_launch  done  0.4s
+  setup new_context     done  0.1s
+  setup goto            done  1.2s
 [mobile-commute-prospect] Marcus Webb -> https://linear.app (2 flows)
-[+  3.8s indie-dev-considering-linear/...--scan-pricing-and-bail-or-buy] step 1: Find a price for the smallest paid plan.
-[+  5.6s indie-dev-considering-linear/...--scan-pricing-and-bail-or-buy]   observe -> MATCH: "$10/user" heading visible in pricing grid
-[+  7.4s indie-dev-considering-linear/...--scan-pricing-and-bail-or-buy]   act -> OK scroll_to "$10/user"
-[+ 11.2s indie-dev-considering-linear/...--scan-pricing-and-bail-or-buy]   verdict=success
+[+  3.8s indie-dev/...scan-pricing-and-bail-or-buy] step 1: Find a price for the smallest paid plan.
+[+  5.6s indie-dev/...scan-pricing-and-bail-or-buy]   observe   AI live 1.8s -> MATCH: "$10/user" heading visible in pricing grid
+[+  7.4s indie-dev/...scan-pricing-and-bail-or-buy]   act       AI cache 0.1s -> OK scroll_to "$10/user"
+[+ 11.2s indie-dev/...scan-pricing-and-bail-or-buy]   verdict=success
 ...
 
 summary: personas=2 flows=5 failures=14 [completed=2 abandoned=3]
@@ -137,9 +146,19 @@ cache: hits=0 misses=42 writes=42 (0% hit-rate)
 
 artifacts: .gauntlet/runs/2026-05-13T14-32-08-991Z
 
-building report (vetting layer re-runs replays)...
+[Phase vet] vetting findings...
+  axe scan https://linear.app/pricing  done 3.2s (2 violations)
+  ...
+[Phase report]
 report: .gauntlet/runs/2026-05-13T14-32-08-991Z/REPORT.md  (findings=14 verified=8 ...)
 ```
+
+Each flow runs as a detached subprocess by default; if it goes silent
+for 75s the parent kills the entire process group (worker + chromium +
+any rogue ffmpeg) and synthesizes `outcome=timeout`. Pass
+`--no-supervisor` to fall back to in-process execution for debugging.
+Add `--record-video` if you want the WebM video artifact (off by
+default).
 
 `REPORT.md` is a vetted, severity-sorted markdown summary. Open it.
 

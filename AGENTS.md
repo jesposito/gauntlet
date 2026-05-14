@@ -8,10 +8,10 @@ This document covers how to work on Gauntlet — for humans and for AI coding ag
 bun install
 bunx playwright install chromium
 bun run tsc --noEmit       # type check
-bun test                   # 115+ unit tests
+bun test                   # 275+ unit tests
 ```
 
-The test suite is fast (≈ 600 ms). Run it on every change. Type-check passes mean the build passes — no separate build step.
+The test suite is fast (~25s including browser-suite setup). Run it on every change. Type-check passes mean the build passes — no separate build step.
 
 ## Code conventions
 
