@@ -190,6 +190,7 @@ async function generateOneBatch(
       "Object with 'candidates' array. Each candidate has id, character{name,age,context,voice}, behavior{...}, label ('core'|'edge'), optional template_id, and rationale.",
     maxTokens: 8000,
     temperature: 0.8,
+    purpose: "persona_gen",
   });
 
   const unique: PersonaCandidate[] = [];

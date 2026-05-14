@@ -206,6 +206,7 @@ Verdict? Remember: bias toward in_progress; before declaring give_up, check for 
     schemaName: "StepVerdict",
     maxTokens: 400,
     temperature: 0,
+    purpose: "judge",
     ...(ctx.signal ? { signal: ctx.signal } : {}),
   });
   return normalizeVerdict(raw);

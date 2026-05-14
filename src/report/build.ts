@@ -4,12 +4,19 @@ import { buildPersonaReport, listPersonasInRun } from "./generator.ts";
 import { rollUp } from "./rollup.ts";
 import { renderRunReport } from "./render-markdown.ts";
 import { vetAll } from "./vetter.ts";
+import { nullEmitter, type EventEmitter } from "../events.ts";
 import type { PersonaReport, RunReport } from "./schema.ts";
 
 export interface BuildReportOptions {
   runDir: string;
   vet?: boolean;
   vetHeadless?: boolean;
+  /**
+   * Optional event emitter forwarded to the vetter so the report-build phase
+   * narrates itself in real time. Defaults to nullEmitter (silent), so
+   * existing call sites keep working unchanged.
+   */
+  emit?: EventEmitter;
 }
 
 export interface BuildReportResult {
@@ -56,8 +63,12 @@ export async function buildReport(opts: BuildReportOptions): Promise<BuildReport
   }
 
   if (opts.vet !== false) {
+    const emit = opts.emit ?? nullEmitter;
     for (const pr of personaReports) {
-      pr.findings = await vetAll(pr.findings, { headless: opts.vetHeadless ?? true });
+      pr.findings = await vetAll(pr.findings, {
+        headless: opts.vetHeadless ?? true,
+        emit,
+      });
     }
   }
 

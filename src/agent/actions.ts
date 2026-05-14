@@ -241,6 +241,7 @@ Use "element" when an interactive outline entry matches the instruction; idx is 
     schemaName: "LocatorPick",
     maxTokens: 400,
     temperature: 0,
+    purpose: "observe",
     ...(ctx.signal ? { signal: ctx.signal } : {}),
   });
 
@@ -340,6 +341,7 @@ Use match_kind="none" when nothing on the page matches the intent. For fill, val
       schemaName: "ActionPick",
       maxTokens: 500,
       temperature: 0,
+      purpose: "act",
       ...(ctx.signal ? { signal: ctx.signal } : {}),
     });
     return { kind: "ok", value };

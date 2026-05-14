@@ -1,4 +1,5 @@
 import type { ZodSchema } from "zod";
+import { type AiCallPurpose, type EventEmitter, nextCallId, nullEmitter } from "../events.ts";
 import { getAiCache } from "./cache.ts";
 
 export interface AiMessage {
@@ -19,6 +20,31 @@ export interface ProposeOptions<T> {
    * stops mutating state instead of running to completion in the background.
    */
   signal?: AbortSignal;
+  /**
+   * Optional purpose tag for event emission. When set AND a global event
+   * emitter is registered (see setGlobalEventEmitter), the call is bracketed
+   * with ai_call_start / ai_call_end events so renderers can paint a
+   * spinner + cache-aware completion line. Omit to opt out (back-compat).
+   */
+  purpose?: AiCallPurpose;
+}
+
+let _globalEmit: EventEmitter = nullEmitter;
+
+/**
+ * Register the process-wide event emitter that CachingProvider.propose() will
+ * use to bracket AI calls. Threading an `emit` through every propose() call
+ * site would touch ~6 files of pure plumbing; a singleton lets the CLI plug
+ * in once at startup and every nested AI call gets visibility for free.
+ *
+ * Tests should call this at setup and reset to nullEmitter at teardown.
+ */
+export function setGlobalEventEmitter(emit: EventEmitter): void {
+  _globalEmit = emit;
+}
+
+export function getGlobalEventEmitter(): EventEmitter {
+  return _globalEmit;
 }
 
 export interface AiProvider {
@@ -51,18 +77,51 @@ class CachingProvider implements AiProvider {
   }
 
   async propose<T>(opts: ProposeOptions<T>): Promise<T> {
-    const cache = getAiCache();
-    if (!cache?.enabled) return this.inner.propose(opts);
-
-    const inputs = cache.inputsFor(this.inner.name, this.inner.model, opts);
-    const hit = await cache.get<T>(inputs);
-    if (hit !== undefined) {
-      const validated = opts.schema.safeParse(hit);
-      if (validated.success) return validated.data;
+    const emit = _globalEmit;
+    const purpose = opts.purpose;
+    const callId = purpose !== undefined ? nextCallId() : "";
+    const startedAt = Date.now();
+    if (purpose !== undefined) {
+      emit({
+        type: "ai_call_start",
+        callId,
+        purpose,
+        model: this.inner.model,
+        ts: startedAt,
+      });
     }
-    const out = await this.inner.propose(opts);
-    await cache.set(inputs, out);
-    return out;
+
+    let cached = false;
+    try {
+      const cache = getAiCache();
+      if (!cache?.enabled) {
+        return await this.inner.propose(opts);
+      }
+
+      const inputs = cache.inputsFor(this.inner.name, this.inner.model, opts);
+      const hit = await cache.get<T>(inputs);
+      if (hit !== undefined) {
+        const validated = opts.schema.safeParse(hit);
+        if (validated.success) {
+          cached = true;
+          return validated.data;
+        }
+      }
+      const out = await this.inner.propose(opts);
+      await cache.set(inputs, out);
+      return out;
+    } finally {
+      if (purpose !== undefined) {
+        const endedAt = Date.now();
+        emit({
+          type: "ai_call_end",
+          callId,
+          durationMs: endedAt - startedAt,
+          cached,
+          ts: endedAt,
+        });
+      }
+    }
   }
 }
 

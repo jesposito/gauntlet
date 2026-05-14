@@ -7,7 +7,7 @@ import {
   listCuratedPersonas,
 } from "./persona/loader.ts";
 import { runPersona } from "./runner/browser.ts";
-import { runFlow, type FlowEvent } from "./runner/flow-runner.ts";
+import { runFlow } from "./runner/flow-runner.ts";
 import { runWithConcurrency } from "./util/pool.ts";
 import {
   loadAllSurfacesWithDiagnostics,
@@ -46,14 +46,75 @@ import {
 } from "./cli/flag-parsers.ts";
 import { filterFlows, describeCriteria, type FlowFilterCriteria } from "./flow/filter.ts";
 import { resolvePrUrl } from "./target/pr.ts";
+import {
+  flowEventBridge,
+  multiplex,
+  nullEmitter,
+  type EventEmitter,
+} from "./events.ts";
+import { createTextRenderer } from "./renderers/text.ts";
+import { createJsonlRenderer } from "./renderers/jsonl.ts";
 
-interface ParsedArgs {
+/**
+ * Build the renderer pipeline for a long-running command.
+ *
+ * The text renderer always runs (writes phase headers + per-step lines to
+ * stdout). The JSONL renderer is opt-in via `--events-log <path>`; when set,
+ * every event is appended to that file in JSONL form so an agent (Claude)
+ * can `tail -f` and reason about the run in real time.
+ *
+ * If the AI provider module exports a `setGlobalEventEmitter` (Stream A),
+ * we wire the emitter through it so cache-hit / live-call AI events flow
+ * into both renderers without each call site having to plumb an emitter.
+ * The dynamic import keeps this CLI compatible with foundation builds
+ * where Stream A hasn't merged yet.
+ */
+async function buildEmitter(flags: {
+  quiet?: boolean;
+  noColor?: boolean;
+  eventsLog?: string;
+}): Promise<EventEmitter> {
+  const renderers: EventEmitter[] = [];
+  const colorEnabled =
+    flags.noColor !== true && process.env["NO_COLOR"] === undefined;
+  renderers.push(
+    createTextRenderer({
+      isTTY: process.stdout.isTTY ?? false,
+      color: colorEnabled,
+      quiet: flags.quiet === true,
+    }),
+  );
+  if (flags.eventsLog) {
+    renderers.push(createJsonlRenderer({ path: flags.eventsLog }));
+  }
+  const emit = renderers.length === 0 ? nullEmitter : multiplex(...renderers);
+
+  // Stream A wires AI-call events through a process-global emitter exported
+  // by ./ai/provider.ts. If it's there, hand it our emit so cache hits /
+  // live calls show up in both text + JSONL renderers. If it's not there
+  // yet (foundation-only builds), the AI events just don't surface — no
+  // crash, no compile error.
+  try {
+    const mod = (await import("./ai/provider.ts")) as {
+      setGlobalEventEmitter?: (e: EventEmitter) => void;
+    };
+    if (typeof mod.setGlobalEventEmitter === "function") {
+      mod.setGlobalEventEmitter(emit);
+    }
+  } catch {
+    // Provider module shape doesn't matter to the renderer pipeline.
+  }
+
+  return emit;
+}
+
+export interface ParsedArgs {
   command: string;
   positional: string[];
   flags: Record<string, string | boolean>;
 }
 
-function parseArgs(argv: string[]): ParsedArgs {
+export function parseArgs(argv: string[]): ParsedArgs {
   const args = argv.slice(2);
   const command = args[0] ?? "help";
   const rest = args.slice(1);
@@ -154,9 +215,17 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
     { max: 32 },
   );
   const quiet = args.flags.quiet === true;
+  const noColor = args.flags["no-color"] === true;
+  const eventsLog =
+    typeof args.flags["events-log"] === "string"
+      ? args.flags["events-log"]
+      : undefined;
 
   const cwd = process.cwd();
   configureAiCache({ enabled: cacheEnabled, cwd });
+
+  const emit = await buildEmitter({ quiet, noColor, ...(eventsLog ? { eventsLog } : {}) });
+  const onFlowEvent = flowEventBridge(emit);
 
   const filterCriteria: FlowFilterCriteria = {
     flowIds: splitCsv(args.flags.flows),
@@ -303,33 +372,12 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
   }
 
   const startedAt = Date.now();
-  const logEvent = (e: FlowEvent): void => {
-    if (quiet) return;
-    const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1).padStart(5);
-    const prefix = `[+${elapsed}s ${e.personaId}/${e.flowId}]`;
-    switch (e.type) {
-      case "flow_start":
-        console.log(`${prefix} START (${e.totalSteps} steps)`);
-        break;
-      case "step_start":
-        console.log(`${prefix} step ${e.stepIndex + 1}: ${e.intent.slice(0, 100)}`);
-        break;
-      case "step_observe":
-        console.log(`${prefix}   observe -> ${e.matched ? "MATCH" : "NO MATCH"}: ${e.reasoning.slice(0, 100)}`);
-        break;
-      case "step_act":
-        console.log(
-          `${prefix}   act -> ${e.performed ? "OK" : "FAILED"} ${e.action ?? "(none)"}${e.targetName ? ` "${e.targetName.slice(0, 40)}"` : ""}${e.error ? ` err=${e.error.slice(0, 60)}` : ""}`,
-        );
-        break;
-      case "step_verdict":
-        console.log(`${prefix}   verdict=${e.status}: ${e.evidence.slice(0, 100)}`);
-        break;
-      case "flow_end":
-        console.log(`${prefix} END outcome=${e.outcome} duration=${e.durationMs}ms`);
-        break;
-    }
-  };
+  emit({
+    type: "phase_start",
+    phase: "run",
+    label: `running ${plans.length} persona${plans.length === 1 ? "" : "s"} (concurrency=${concurrency})`,
+    ts: Date.now(),
+  });
 
   type PersonaResult = { persona: string; flows: number; failures: number; outcomes: string[] };
 
@@ -370,7 +418,7 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
           provider: getProvider(),
           runDir,
           headless,
-          onEvent: logEvent,
+          onEvent: onFlowEvent,
           ...(storageStatePath ? { storageStatePath } : {}),
           ...(surfaceId ? { surfaceId } : {}),
         });
@@ -382,7 +430,7 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
         const msg = err instanceof Error ? err.message : String(err);
         const firstLine = msg.split("\n")[0] ?? msg;
         console.error(`[${persona.id}/${flow.id}] flow crashed: ${firstLine}`);
-        logEvent({
+        onFlowEvent({
           type: "flow_end",
           personaId: persona.id,
           flowId: flow.id,
@@ -465,12 +513,25 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
     );
   }
 
+  emit({ type: "phase_end", phase: "run", durationMs: Date.now() - startedAt, ts: Date.now() });
   console.log(`\nartifacts: ${baseDir}`);
 
   const skipReport = args.flags["no-report"] === true;
   if (!skipReport) {
-    console.log(`\nbuilding report (vetting layer re-runs replays)...`);
+    const reportStartedAt = Date.now();
+    emit({
+      type: "phase_start",
+      phase: "report",
+      label: "building report (vetting layer re-runs replays)",
+      ts: reportStartedAt,
+    });
     const built = await buildReport({ runDir: baseDir, vet: true });
+    emit({
+      type: "phase_end",
+      phase: "report",
+      durationMs: Date.now() - reportStartedAt,
+      ts: Date.now(),
+    });
     console.log(
       `report: ${built.markdownPath}  (findings=${built.report.totals.findings} verified=${built.report.totals.verified} subjective=${built.report.totals.subjective} regressed=${built.report.totals.regressed})`,
     );
@@ -488,8 +549,27 @@ async function cmdReport(args: ParsedArgs): Promise<void> {
     process.exit(2);
   }
   const skipVet = args.flags["no-vet"] === true;
+  const noColor = args.flags["no-color"] === true;
+  const eventsLog =
+    typeof args.flags["events-log"] === "string"
+      ? args.flags["events-log"]
+      : undefined;
+  const emit = await buildEmitter({ noColor, ...(eventsLog ? { eventsLog } : {}) });
   console.log(`gauntlet report -> ${target}${skipVet ? " (vetting disabled)" : ""}`);
+  const reportStartedAt = Date.now();
+  emit({
+    type: "phase_start",
+    phase: "report",
+    label: skipVet ? "synthesizing report (vetting disabled)" : "synthesizing report + vetting",
+    ts: reportStartedAt,
+  });
   const built = await buildReport({ runDir: target, vet: !skipVet });
+  emit({
+    type: "phase_end",
+    phase: "report",
+    durationMs: Date.now() - reportStartedAt,
+    ts: Date.now(),
+  });
   console.log(
     `\nreport: ${built.markdownPath}\njson:   ${built.jsonPath}\nfindings=${built.report.totals.findings} verified=${built.report.totals.verified} subjective=${built.report.totals.subjective} regressed=${built.report.totals.regressed} could_not_replay=${built.report.totals.couldNotReplay} unverified=${built.report.totals.unverified}`,
   );
@@ -659,6 +739,13 @@ async function cmdSeed(args: ParsedArgs): Promise<void> {
     process.exit(2);
   }
 
+  const noColor = args.flags["no-color"] === true;
+  const eventsLog =
+    typeof args.flags["events-log"] === "string"
+      ? args.flags["events-log"]
+      : undefined;
+  const emit = await buildEmitter({ noColor, ...(eventsLog ? { eventsLog } : {}) });
+
   console.log(`gauntlet seed`);
   console.log(`  cwd:      ${cwd}`);
   console.log(`  urls:     ${urls.join(", ")}`);
@@ -670,6 +757,14 @@ async function cmdSeed(args: ParsedArgs): Promise<void> {
 
   configureAiCache({ enabled: cacheEnabled, cwd });
   const provider = pickProvider(model);
+
+  const seedStartedAt = Date.now();
+  emit({
+    type: "phase_start",
+    phase: "init",
+    label: "seeding project (surfaces + personas + flows)",
+    ts: seedStartedAt,
+  });
 
   const result = await seedProject({
     cwd,
@@ -696,6 +791,12 @@ async function cmdSeed(args: ParsedArgs): Promise<void> {
   for (const s of result.surfaces) {
     console.log(`  gauntlet run --surface ${s.id}`);
   }
+  emit({
+    type: "phase_end",
+    phase: "init",
+    durationMs: Date.now() - seedStartedAt,
+    ts: Date.now(),
+  });
 }
 
 async function cmdCrossReport(args: ParsedArgs): Promise<void> {
@@ -865,6 +966,13 @@ async function cmdInit(args: ParsedArgs): Promise<void> {
     process.exit(2);
   }
 
+  const noColor = args.flags["no-color"] === true;
+  const eventsLog =
+    typeof args.flags["events-log"] === "string"
+      ? args.flags["events-log"]
+      : undefined;
+  const emit = await buildEmitter({ noColor, ...(eventsLog ? { eventsLog } : {}) });
+
   console.log(`gauntlet init`);
   console.log(`  cwd:    ${cwd}`);
   console.log(`  model:  ${model}`);
@@ -880,7 +988,13 @@ async function cmdInit(args: ParsedArgs): Promise<void> {
   configureAiCache({ enabled: cacheEnabled, cwd });
   const provider = pickProvider(model);
 
-  console.log("\n[Phase A] reading project context...");
+  const initStartedAt = Date.now();
+  emit({
+    type: "phase_start",
+    phase: "init",
+    label: "reading project context (README, package.json, landings)",
+    ts: initStartedAt,
+  });
   const project = await readProject({ cwd, urls, probePaths: probeEnabled });
   const reachable = project.landings.filter((l) => l.reachable).length;
   const unreachable = project.landings.length - reachable;
@@ -915,7 +1029,12 @@ async function cmdInit(args: ParsedArgs): Promise<void> {
       `\n[Phase A2] skipped (--skip-surfaces); reusing ${surfaces.length} curated surface${surfaces.length === 1 ? "" : "s"}.`,
     );
   } else if (surfaces.length === 0 || refreshSurfaces) {
-    console.log("\n[Phase A2] AI proposing surfaces from landings + README...");
+    emit({
+      type: "phase_start",
+      phase: "init",
+      label: "AI proposing surfaces from landings + README",
+      ts: Date.now(),
+    });
     const proposed = await generateSurfaces({
       provider,
       project,
@@ -938,6 +1057,12 @@ async function cmdInit(args: ParsedArgs): Promise<void> {
     console.log(
       `\n[Phase B] skipped (--skip-personas). Surfaces are written; rerun without the flag to generate personas.`,
     );
+    emit({
+      type: "phase_end",
+      phase: "init",
+      durationMs: Date.now() - initStartedAt,
+      ts: Date.now(),
+    });
     return;
   }
 
@@ -977,9 +1102,12 @@ async function cmdInit(args: ParsedArgs): Promise<void> {
     );
   }
 
-  console.log(
-    `\n[Phase B] asking AI for candidate personas${onlySurfaceId ? ` on surface "${onlySurfaceId}"` : ""}...`,
-  );
+  emit({
+    type: "phase_start",
+    phase: "init",
+    label: `AI proposing candidate personas${onlySurfaceId ? ` on surface "${onlySurfaceId}"` : ""}`,
+    ts: Date.now(),
+  });
   const candidates = await generateCandidates({
     provider,
     project,
@@ -1019,6 +1147,12 @@ async function cmdInit(args: ParsedArgs): Promise<void> {
         "` to design test flows per persona.",
     );
   }
+  emit({
+    type: "phase_end",
+    phase: "init",
+    durationMs: Date.now() - initStartedAt,
+    ts: Date.now(),
+  });
 }
 
 async function cmdFlows(args: ParsedArgs): Promise<void> {
@@ -1064,6 +1198,13 @@ async function cmdFlows(args: ParsedArgs): Promise<void> {
     personaIds = kept;
   }
 
+  const noColor = args.flags["no-color"] === true;
+  const eventsLog =
+    typeof args.flags["events-log"] === "string"
+      ? args.flags["events-log"]
+      : undefined;
+  const emit = await buildEmitter({ noColor, ...(eventsLog ? { eventsLog } : {}) });
+
   console.log(`gauntlet flows`);
   console.log(`  cwd:      ${cwd}`);
   console.log(`  model:    ${model}`);
@@ -1094,7 +1235,13 @@ async function cmdFlows(args: ParsedArgs): Promise<void> {
   configureAiCache({ enabled: cacheEnabled, cwd });
   const provider = pickProvider(model);
 
-  console.log("\n[Phase A] reading project context...");
+  const flowsStartedAt = Date.now();
+  emit({
+    type: "phase_start",
+    phase: "flows",
+    label: "reading project context",
+    ts: flowsStartedAt,
+  });
   const project = await readProject({ cwd, urls: url ? [url] : [] });
   console.log(
     `  project=${project.projectName ?? "(unknown)"} bytes=${project.totalBytes}`,
@@ -1125,7 +1272,12 @@ async function cmdFlows(args: ParsedArgs): Promise<void> {
     const persona = await loadPersona(id, cwd);
     const surface = await surfaceFor(persona.surface);
     const surfaceTag = surface ? ` [surface=${surface.id}]` : persona.surface ? ` [surface=${persona.surface} (yaml missing)]` : "";
-    console.log(`\n[Phase C] ${persona.id} (${persona.character.name})${surfaceTag}`);
+    emit({
+      type: "phase_start",
+      phase: "flows",
+      label: `${persona.id} (${persona.character.name})${surfaceTag}`,
+      ts: Date.now(),
+    });
     const flowOpts: Parameters<typeof generateFlows>[0] = { provider, project, persona, count };
     if (surface) flowOpts.surface = surface;
     if (focus) flowOpts.focus = focus;
@@ -1152,6 +1304,12 @@ async function cmdFlows(args: ParsedArgs): Promise<void> {
     console.log(`  ${s.persona.padEnd(28)} accepted=${s.accepted} rejected=${s.rejected}`);
   }
   console.log(`\nflows written to ${join(cwd, ".gauntlet/flows")}/`);
+  emit({
+    type: "phase_end",
+    phase: "flows",
+    durationMs: Date.now() - flowsStartedAt,
+    ts: Date.now(),
+  });
 }
 
 function cmdHelp(): void {
@@ -1260,6 +1418,9 @@ run misc:
   --no-cache            disable AI response cache
   --no-flows            force legacy single-step capture even if flows exist
   --no-report           skip post-run report build
+  --no-color            disable ANSI color in text renderer (NO_COLOR env honored too)
+  --events-log <path>   append every event to this JSONL file. tail -f to drive
+                        gauntlet from an agent (Claude) in real time.
 
 run examples:
   gauntlet run --url https://staging.example.com --features checkout
@@ -1271,6 +1432,14 @@ run examples:
 report flags:
   --run <path>       path to a run directory (default: latest under .gauntlet/runs/)
   --no-vet           skip replay vetting (faster, but findings stay unverified)
+  --no-color         disable ANSI color in text renderer
+  --events-log <p>   append every event to this JSONL file (for agent tailing)
+
+instrumentation (works on init / flows / run / report / seed):
+  --no-color            disable ANSI color in text renderer (NO_COLOR env also honored)
+  --events-log <path>   append the full GauntletEvent stream to this JSONL file.
+                        Designed for an agent (Claude) to \`tail -f\` while gauntlet
+                        runs. The text renderer always writes to stdout in addition.
 `);
 }
 
@@ -1322,7 +1491,10 @@ async function main(): Promise<void> {
   }
 }
 
-main()
+// Only auto-run when invoked as the entrypoint. Tests import parseArgs from
+// this module without wanting `main()` to fire and consume process.argv.
+if (import.meta.main) {
+  main()
   .then(() => {
     // Force exit: keep-alive HTTP sockets (Anthropic/OpenAI) and any lingering
     // Playwright handles can hold the event loop open even after all our work
@@ -1340,3 +1512,4 @@ main()
     console.error("fatal:", err);
     process.exit(1);
   });
+}
