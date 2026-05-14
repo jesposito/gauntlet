@@ -22,6 +22,16 @@ deadline so video stays opt-in).
 
 ---
 
+## Don't want to run the commands yourself? Point your AI at gauntlet.
+
+Open Claude Code (or Cursor / any AI-coding agent) in your project directory and paste:
+
+> Set up and run gauntlet against this project. Read [`docs/FOR-AI-AGENTS.md`](https://github.com/jesposito/gauntlet/blob/main/docs/FOR-AI-AGENTS.md) first — it has every command, flag, event-stream format, and decision rule you need. After the run completes, summarize the verified findings and propose fixes for the top 3.
+
+[`docs/FOR-AI-AGENTS.md`](docs/FOR-AI-AGENTS.md) is gauntlet's source-of-truth contract for AI agents: install steps, full flag inventory, the JSONL event protocol for monitoring runs in real time, output interpretation (verified vs subjective vs regressed), and rules for what to do (and what NOT to do — like editing source code based on findings without asking). Agents don't need to read this README.
+
+---
+
 ## What it actually finds
 
 To validate the design, Gauntlet was dogfooded against a real multi-tenant creator platform with four distinct surfaces (marketing site, customer portfolios, creator admin panel, and a public demo). The first pass produced **49 findings**. Triaging them and shipping one afternoon's PR closed 10 real bugs:

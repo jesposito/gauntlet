@@ -568,6 +568,164 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
       `report: ${built.markdownPath}  (findings=${built.report.totals.findings} verified=${built.report.totals.verified} subjective=${built.report.totals.subjective} regressed=${built.report.totals.regressed})`,
     );
   }
+
+  // Post-run cleanup prompt. Skip in non-TTY (CI / agent-driven) so the
+  // run terminates cleanly. Skip when --auto-clean (always trim) or
+  // --no-clean-prompt (always keep) are set explicitly.
+  await maybePromptCleanup(baseDir, {
+    autoClean: args.flags["auto-clean"] === true,
+    noPrompt: args.flags["no-clean-prompt"] === true,
+  });
+}
+
+/**
+ * Post-run cleanup prompt. Shows the user what this run cost on disk and
+ * offers three options:
+ *   k(eep)  — leave the run dir untouched [default]
+ *   t(rim)  — drop the heavy per-step artifacts (DOM html, ax-tree json,
+ *             axe json, network/console jsonl, video webm). Keeps
+ *             screenshots + flow-result.json + REPORT.md.
+ *   d(elete)- delete this run entirely
+ *
+ * Skipped in non-TTY (CI / agent) and when --auto-clean / --no-clean-prompt
+ * are set. When --auto-clean is set, trim is performed silently.
+ */
+async function maybePromptCleanup(
+  runDir: string,
+  flags: { autoClean: boolean; noPrompt: boolean },
+): Promise<void> {
+  const { summarizeRun, trimRunArtifacts, deleteRun, formatBytes } =
+    await import("./runner/cleanup.ts");
+  const summary = await summarizeRun(runDir);
+
+  if (flags.autoClean) {
+    const freed = await trimRunArtifacts(runDir);
+    console.log(`cleanup: trimmed ${formatBytes(freed)} of per-step artifacts (auto-clean).`);
+    return;
+  }
+  if (flags.noPrompt) return;
+  if (!process.stdin.isTTY || !process.stdout.isTTY) return;
+
+  console.log(
+    `\nthis run wrote ${formatBytes(summary.bytes)} across ${summary.files} files at ${runDir}`,
+  );
+  console.log(`cleanup? [k]eep / [t]rim per-step / [d]elete entire run  (default: keep)`);
+  process.stdout.write("> ");
+
+  const answer = await new Promise<string>((resolve) => {
+    let buf = "";
+    process.stdin.setEncoding("utf8");
+    const onData = (chunk: string): void => {
+      buf += chunk;
+      const nl = buf.indexOf("\n");
+      if (nl >= 0) {
+        process.stdin.removeListener("data", onData);
+        process.stdin.pause();
+        resolve(buf.slice(0, nl).trim().toLowerCase());
+      }
+    };
+    process.stdin.resume();
+    process.stdin.on("data", onData);
+    // Don't block forever: 30s default-keep timeout.
+    setTimeout(() => {
+      process.stdin.removeListener("data", onData);
+      process.stdin.pause();
+      resolve("k");
+    }, 30_000).unref?.();
+  });
+
+  if (answer === "t" || answer === "trim") {
+    const freed = await trimRunArtifacts(runDir);
+    console.log(`cleanup: trimmed ${formatBytes(freed)} of per-step artifacts. report + screenshots kept.`);
+  } else if (answer === "d" || answer === "delete") {
+    try {
+      const freed = await deleteRun(runDir);
+      console.log(`cleanup: deleted ${formatBytes(freed)} (entire run).`);
+    } catch (err) {
+      console.error(`cleanup: refused — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  } else {
+    console.log(`cleanup: kept. run \`gauntlet doctor\` later to clean up old runs.`);
+  }
+}
+
+async function cmdDoctor(args: ParsedArgs): Promise<void> {
+  const {
+    summarizeRun,
+    pruneOldRuns,
+    reapTmpLeaks,
+    formatBytes,
+  } = await import("./runner/cleanup.ts");
+  const cwd = process.cwd();
+  const runsDir = join(cwd, ".gauntlet", "runs");
+
+  console.log(`gauntlet doctor — checking ${cwd}`);
+  console.log("");
+
+  // Inventory existing runs.
+  let runs: string[] = [];
+  try {
+    const { readdirSync } = await import("node:fs");
+    runs = readdirSync(runsDir)
+      .filter((n) => /^\d{4}-\d{2}-\d{2}T/.test(n))
+      .sort();
+  } catch {
+    /* no .gauntlet/runs */
+  }
+
+  if (runs.length === 0) {
+    console.log("no runs found under .gauntlet/runs/");
+  } else {
+    let totalBytes = 0;
+    for (const r of runs) {
+      const s = await summarizeRun(join(runsDir, r));
+      totalBytes += s.bytes;
+    }
+    console.log(`runs: ${runs.length} run dirs, ${formatBytes(totalBytes)} total`);
+    console.log(`  oldest: ${runs[0]}`);
+    console.log(`  newest: ${runs[runs.length - 1]}`);
+  }
+  console.log("");
+
+  const pruneArg = args.flags["prune-runs"];
+  const reapTmp = args.flags["reap-tmp"] === true;
+  const all = args.flags.all === true;
+
+  let didSomething = false;
+
+  if (pruneArg !== undefined || all) {
+    const keep = typeof pruneArg === "string" ? Number(pruneArg) : 5;
+    if (!Number.isFinite(keep) || keep < 0) {
+      console.error(`error: --prune-runs must be a non-negative integer, got ${pruneArg}`);
+      process.exit(2);
+    }
+    const r = await pruneOldRuns(runsDir, keep);
+    console.log(
+      `prune-runs: kept latest ${keep}, deleted ${r.deleted.length} (${formatBytes(r.bytesFreed)} freed)`,
+    );
+    if (r.deleted.length > 0) {
+      for (const d of r.deleted.slice(0, 5)) console.log(`  - ${d}`);
+      if (r.deleted.length > 5) console.log(`  ... +${r.deleted.length - 5} more`);
+    }
+    didSomething = true;
+  }
+
+  if (reapTmp || all) {
+    const r = await reapTmpLeaks();
+    console.log(
+      `reap-tmp: deleted ${r.deleted.length} stale tmpdirs (${formatBytes(r.bytesFreed)} freed)`,
+    );
+    didSomething = true;
+  }
+
+  if (!didSomething) {
+    console.log("(no actions taken — pass --prune-runs [N], --reap-tmp, or --all)");
+    console.log("");
+    console.log("examples:");
+    console.log("  gauntlet doctor --prune-runs 3   # keep latest 3 runs, delete the rest");
+    console.log("  gauntlet doctor --reap-tmp        # clean stale Playwright tmpdirs");
+    console.log("  gauntlet doctor --all             # both, with default keep=5");
+  }
 }
 
 async function cmdReport(args: ParsedArgs): Promise<void> {
@@ -1459,6 +1617,18 @@ run misc:
                         no internal deadline and has wedged production runs
                         for 12+ minutes. Screenshots, axe, and DOM artifacts
                         do not depend on this flag.
+  --auto-clean          after the run, automatically trim per-step heavy
+                        artifacts (DOM/ax-tree/axe/network/console/video).
+                        Keeps screenshots + flow-result.json + REPORT.md.
+                        Use in CI / automation where you don't want a prompt.
+  --no-clean-prompt     skip the post-run cleanup prompt entirely (always
+                        keep). Default behavior in non-TTY environments.
+
+doctor command — clean up gauntlet's filesystem footprint:
+  gauntlet doctor                       summary only (no actions taken)
+  gauntlet doctor --prune-runs [N]      keep latest N runs (default 5), delete the rest
+  gauntlet doctor --reap-tmp            delete stale Playwright tmpdirs (>1h old)
+  gauntlet doctor --all                 do both
   --no-supervisor       run flows in-process instead of as a supervised
                         subprocess (debug only). Default ON — each flow runs
                         in its own detached process group with a parent-side
@@ -1501,6 +1671,9 @@ async function main(): Promise<void> {
       break;
     case "report":
       await cmdReport(args);
+      break;
+    case "doctor":
+      await cmdDoctor(args);
       break;
     case "surfaces":
       await cmdSurfaces();
