@@ -135,6 +135,40 @@ describe("normalizeVerdict (permissive AI output -> strict union)", () => {
     }
   });
 
+  test("accepts null on optional fields (facets-sh 2026-05-14 dogfood)", () => {
+    // Real AI output that crashed the run pre-fix:
+    //   {"status":"success","evidence":"...","give_up_reason":null,"give_up_class":null}
+    // Pre-fix the schema rejected with `give_up_reason: Expected string,
+    // received null` and the error escaped as outcome="error". `.nullish()`
+    // accepts null + undefined; normalization collapses both away.
+    const raw = RawStepVerdictSchema.parse({
+      status: "success",
+      give_up_reason: null,
+      give_up_class: null,
+      evidence: "Heading [6] visible, no modal.",
+    });
+    const v = normalizeVerdict(raw);
+    expect(v.status).toBe("success");
+    expect("give_up_reason" in v).toBe(false);
+    expect("give_up_class" in v).toBe(false);
+  });
+
+  test("accepts null on a give_up verdict and defaults class to 'bug'", () => {
+    const raw = RawStepVerdictSchema.parse({
+      status: "give_up",
+      give_up_reason: null,
+      give_up_class: null,
+      evidence: "no help text on the form",
+    });
+    const v = normalizeVerdict(raw);
+    if (v.status === "give_up") {
+      expect(v.give_up_class).toBe("bug");
+      expect(v.give_up_reason).toBe("no help text on the form");
+    } else {
+      throw new Error("expected give_up");
+    }
+  });
+
   test("strips give_up fields from non-give_up verdicts", () => {
     // Even if the AI hallucinated extra fields on a success, normalization
     // returns the strict shape. The discriminated union enforces it.
