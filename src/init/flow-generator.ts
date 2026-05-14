@@ -135,6 +135,7 @@ DO NOT propose flows that reference features in "NOT available". The persona can
       "Object with 'flows' array. Each flow has id, persona_id, title, goal, optional starting_url_hint, steps[], rationale.",
     maxTokens: 6000,
     temperature: 0.7,
+    purpose: "flow_gen",
   });
 
   return result.flows.map((f) => ({ ...f, persona_id: opts.persona.id })) as Flow[];

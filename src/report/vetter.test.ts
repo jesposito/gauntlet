@@ -1,5 +1,14 @@
-import { describe, expect, test } from "bun:test";
-import { raceWithTimeout, withVetTimeout } from "./vetter.ts";
+import { afterEach, describe, expect, test } from "bun:test";
+import {
+  _setAxeRunnerForTesting,
+  _setBrowserLauncherForTesting,
+  raceWithTimeout,
+  vetAll,
+  withVetTimeout,
+} from "./vetter.ts";
+import type { Finding } from "./schema.ts";
+import type { GauntletEvent } from "../events.ts";
+import { FailureReason } from "../runner/failure-reasons.ts";
 
 describe("withVetTimeout", () => {
   // Real-world dogfood (audplexus 2026-05-13): the vetter hung 20+ minutes
@@ -78,5 +87,217 @@ describe("raceWithTimeout (close-side, swallow-on-timeout)", () => {
     } finally {
       console.warn = orig;
     }
+  });
+
+  test("routes warnings through emit when an emitter is provided (no console.warn)", async () => {
+    const events: GauntletEvent[] = [];
+    const orig = console.warn;
+    let consoleCalled = false;
+    console.warn = () => {
+      consoleCalled = true;
+    };
+    try {
+      const failing = Promise.reject(new Error("orphan context"));
+      await raceWithTimeout(
+        "emit-close",
+        failing,
+        1_000,
+        (e) => events.push(e),
+      );
+      expect(consoleCalled).toBe(false);
+      const warns = events.filter((e) => e.type === "warn");
+      expect(warns.length).toBe(1);
+      expect((warns[0] as Extract<GauntletEvent, { type: "warn" }>).message).toMatch(
+        /emit-close threw during close: orphan context/,
+      );
+    } finally {
+      console.warn = orig;
+    }
+  });
+});
+
+// --------------------------------------------------------------------------
+// vetAll event emission
+//
+// Real-world dogfood (audplexus 2026-05-14): a 23-finding vetter ran ~25min
+// with zero terminal output between "building report" and the final write.
+// These tests pin the event-stream contract that lets renderers narrate the
+// vetting phase in real time, so that hostile-case experience never recurs.
+// --------------------------------------------------------------------------
+
+interface FakePageHooks {
+  onGoto?: () => void | Promise<void>;
+}
+
+function makeFakeBrowser(hooks: FakePageHooks = {}): {
+  browser: { newContext: () => Promise<unknown>; close: () => Promise<void> };
+  closeCount: { value: number };
+} {
+  const closeCount = { value: 0 };
+  const fakePage = {
+    on: () => fakePage,
+    goto: async () => {
+      if (hooks.onGoto) await hooks.onGoto();
+      return null;
+    },
+    waitForTimeout: async () => undefined,
+  } as const;
+  const fakeContext = {
+    newPage: async () => fakePage,
+    close: async () => undefined,
+  };
+  const browser = {
+    newContext: async () => fakeContext,
+    close: async () => {
+      closeCount.value += 1;
+    },
+  };
+  return { browser, closeCount };
+}
+
+function baseFinding(overrides: Partial<Finding> = {}): Finding {
+  return {
+    id: "f1",
+    personaId: "p1",
+    url: "https://example.test/",
+    reason: FailureReason.ACCESSIBILITY_VIOLATION,
+    severity: "moderate",
+    title: "x",
+    detail: "y",
+    artifacts: {},
+    replayStrategy: "axe_recheck",
+    axeRuleId: "color-contrast",
+    vetting: { status: "unverified" },
+    ...overrides,
+  } as Finding;
+}
+
+describe("vetAll event emission", () => {
+  afterEach(() => {
+    _setBrowserLauncherForTesting(undefined);
+    _setAxeRunnerForTesting(undefined);
+  });
+
+  test("emits the full per-URL lifecycle in order", async () => {
+    const { browser } = makeFakeBrowser();
+    _setBrowserLauncherForTesting({ launch: async () => browser as never });
+    _setAxeRunnerForTesting(async () => ({
+      violations: [{ id: "color-contrast" }],
+    }));
+
+    const events: GauntletEvent[] = [];
+    await vetAll(
+      [
+        baseFinding({ id: "f1", axeRuleId: "color-contrast" }),
+        baseFinding({ id: "f2", axeRuleId: "missing-rule" }),
+      ],
+      { emit: (e) => events.push(e) },
+    );
+
+    const types = events.map((e) => e.type);
+    // Required ordering for a single URL serving two findings.
+    const expected: GauntletEvent["type"][] = [
+      "vet_start",
+      "vet_url_start",
+      "vet_url_navigate",
+      "vet_url_axe_start",
+      "vet_url_axe_end",
+      "vet_finding",
+      "vet_finding",
+      "vet_url_close",
+      "vet_end",
+    ];
+    expect(types).toEqual(expected);
+  });
+
+  test("vet_end summary counts match per-finding statuses", async () => {
+    const { browser } = makeFakeBrowser();
+    _setBrowserLauncherForTesting({ launch: async () => browser as never });
+    // axe rule "still-broken" present -> regressed; "fixed" absent -> verified.
+    _setAxeRunnerForTesting(async () => ({
+      violations: [{ id: "still-broken" }],
+    }));
+
+    const events: GauntletEvent[] = [];
+    await vetAll(
+      [
+        baseFinding({ id: "f1", axeRuleId: "still-broken" }),
+        baseFinding({ id: "f2", axeRuleId: "fixed" }),
+        baseFinding({
+          id: "f3",
+          replayStrategy: "none",
+          axeRuleId: undefined,
+        }),
+      ],
+      { emit: (e) => events.push(e) },
+    );
+
+    const end = events.find((e) => e.type === "vet_end") as
+      | Extract<GauntletEvent, { type: "vet_end" }>
+      | undefined;
+    expect(end).toBeDefined();
+    expect(end!.regressed).toBe(1);
+    expect(end!.verified).toBe(1);
+    expect(end!.subjective).toBe(1);
+    expect(end!.couldNotReplay).toBe(0);
+  });
+
+  test("emits warn + could_not_replay vet_finding when openSession fails", async () => {
+    const { browser } = makeFakeBrowser({
+      onGoto: async () => {
+        // openSession itself doesn't throw on goto failure (it captures
+        // navError + sets navigatedOk=false). To trigger the catch branch
+        // (warn path) we make runAxe throw during the in-progress session.
+      },
+    });
+    _setBrowserLauncherForTesting({ launch: async () => browser as never });
+    _setAxeRunnerForTesting(async () => {
+      throw new Error("axe blew up");
+    });
+
+    const events: GauntletEvent[] = [];
+    await vetAll([baseFinding({ id: "f1" })], {
+      emit: (e) => events.push(e),
+    });
+
+    const warns = events.filter((e) => e.type === "warn");
+    expect(warns.length).toBeGreaterThanOrEqual(1);
+    const finding = events.find(
+      (e) => e.type === "vet_finding",
+    ) as Extract<GauntletEvent, { type: "vet_finding" }>;
+    expect(finding.status).toBe("could_not_replay");
+  });
+
+  test("vet_start carries total + distinctUrls; sessionTotal aggregates by url+surface", async () => {
+    const { browser } = makeFakeBrowser();
+    _setBrowserLauncherForTesting({ launch: async () => browser as never });
+    _setAxeRunnerForTesting(async () => ({ violations: [] }));
+
+    const events: GauntletEvent[] = [];
+    await vetAll(
+      [
+        baseFinding({ id: "f1", url: "https://a.test/" }),
+        baseFinding({ id: "f2", url: "https://a.test/" }),
+        baseFinding({ id: "f3", url: "https://b.test/" }),
+      ],
+      { emit: (e) => events.push(e) },
+    );
+
+    const start = events.find((e) => e.type === "vet_start") as Extract<
+      GauntletEvent,
+      { type: "vet_start" }
+    >;
+    expect(start.total).toBe(3);
+    expect(start.distinctUrls).toBe(2);
+
+    const urlStarts = events.filter(
+      (e) => e.type === "vet_url_start",
+    ) as Extract<GauntletEvent, { type: "vet_url_start" }>[];
+    expect(urlStarts.length).toBe(2);
+    expect(urlStarts[0]!.sessionIndex).toBe(1);
+    expect(urlStarts[1]!.sessionIndex).toBe(2);
+    expect(urlStarts[0]!.sessionTotal).toBe(2);
+    // First URL has 2 findings sharing it.
+    expect(urlStarts[0]!.findingCount).toBe(2);
   });
 });

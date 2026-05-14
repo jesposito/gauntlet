@@ -1,12 +1,37 @@
-import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
-import { runAxe } from "../runner/axe-scan.ts";
+import { chromium, type Browser, type BrowserContext, type LaunchOptions, type Page } from "playwright";
+import { runAxe as runAxeReal } from "../runner/axe-scan.ts";
 import type { Finding } from "./schema.ts";
 import { FailureReason } from "../runner/failure-reasons.ts";
 import { loadSurface } from "../surface/loader.ts";
 import { resolveAuthStatePath } from "../auth/capture.ts";
+import { nullEmitter, type EventEmitter } from "../events.ts";
 
+/**
+ * Test seam, mirrors src/runner/browser.ts. Production uses real chromium;
+ * tests inject a fake launcher + fake axe scanner so vetAll can be exercised
+ * end-to-end without spawning a real browser. See vetter.test.ts.
+ */
+export interface BrowserLauncher {
+  launch(opts: LaunchOptions): Promise<Browser>;
+}
+let _launcher: BrowserLauncher = chromium;
+export function _setBrowserLauncherForTesting(l: BrowserLauncher | undefined): void {
+  _launcher = l ?? chromium;
+}
+type AxeFn = (page: Page) => Promise<{ violations: { id: string }[] }>;
+let _runAxe: AxeFn = runAxeReal as unknown as AxeFn;
+export function _setAxeRunnerForTesting(fn: AxeFn | undefined): void {
+  _runAxe = fn ?? (runAxeReal as unknown as AxeFn);
+}
+
+/**
+ * The vetter never produces `"unverified"` — that status only exists for
+ * findings the report knows about but hasn't run through vetAll. Narrowing
+ * the union here lets the event-emit sites pass `v.status` straight to a
+ * VetStatus-typed event without a cast.
+ */
 export interface VetResult {
-  status: Finding["vetting"]["status"];
+  status: Exclude<Finding["vetting"]["status"], "unverified">;
   note: string;
   rePassed?: boolean;
 }
@@ -26,7 +51,8 @@ async function openSession(
   browser: Browser,
   url: string,
   timeoutMs: number,
-  storageStatePath?: string,
+  storageStatePath: string | undefined,
+  emit: EventEmitter,
 ): Promise<UrlSession> {
   const context = await browser.newContext(
     storageStatePath ? { storageState: storageStatePath } : {},
@@ -43,6 +69,7 @@ async function openSession(
 
   let navigatedOk = true;
   let navError: string | undefined;
+  const navStart = Date.now();
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: timeoutMs });
     await page.waitForTimeout(800);
@@ -50,11 +77,46 @@ async function openSession(
     navigatedOk = false;
     navError = err instanceof Error ? err.message : String(err);
   }
+  emit({
+    type: "vet_url_navigate",
+    url,
+    durationMs: Date.now() - navStart,
+    ok: navigatedOk,
+    ts: Date.now(),
+  });
 
   let axeRuleIds = new Set<string>();
   if (navigatedOk) {
-    const axe = await runAxe(page);
-    axeRuleIds = new Set(axe.violations.map((v) => v.id));
+    emit({ type: "vet_url_axe_start", url, ts: Date.now() });
+    const axeStart = Date.now();
+    // Heartbeat every 5s during axe so non-TTY consumers (Claude tailing
+    // JSONL, CI logs) see explicit "still alive" signals during slow scans.
+    // unref() so the timer never keeps the loop alive on its own.
+    const heartbeat = setInterval(() => {
+      emit({
+        type: "heartbeat",
+        phase: "vet",
+        label: `axe scan ${url}`,
+        elapsedMs: Date.now() - axeStart,
+        ts: Date.now(),
+      });
+    }, 5_000);
+    if (typeof heartbeat.unref === "function") heartbeat.unref();
+    let violationCount = 0;
+    try {
+      const axe = await _runAxe(page);
+      axeRuleIds = new Set(axe.violations.map((v) => v.id));
+      violationCount = axe.violations.length;
+    } finally {
+      clearInterval(heartbeat);
+      emit({
+        type: "vet_url_axe_end",
+        url,
+        violationCount,
+        durationMs: Date.now() - axeStart,
+        ts: Date.now(),
+      });
+    }
   }
 
   return {
@@ -78,30 +140,47 @@ async function openSession(
  * post-vetAll close. We'd rather leak the OS handle than block forever.
  */
 const CLOSE_TIMEOUT_MS = 8_000;
-async function closeSession(s: UrlSession): Promise<void> {
-  await raceWithTimeout(`closeSession(${s.url})`, s.context.close(), CLOSE_TIMEOUT_MS);
+async function closeSession(s: UrlSession, emit: EventEmitter): Promise<void> {
+  await raceWithTimeout(`closeSession(${s.url})`, s.context.close(), CLOSE_TIMEOUT_MS, emit);
+  emit({ type: "vet_url_close", url: s.url, ts: Date.now() });
 }
 
-async function closeBrowserBounded(browser: Browser): Promise<void> {
-  await raceWithTimeout("browser.close", browser.close(), CLOSE_TIMEOUT_MS);
+async function closeBrowserBounded(browser: Browser, emit: EventEmitter): Promise<void> {
+  await raceWithTimeout("browser.close", browser.close(), CLOSE_TIMEOUT_MS, emit);
 }
 
 /**
  * Same shape as withVetTimeout below but swallow-on-timeout: close paths must
  * not throw because the outer finally is still trying to release the next
  * resource. A timed-out close is logged and we continue.
+ *
+ * When `emit` is the nullEmitter (default — no event stream wired) we keep
+ * the legacy console.warn output so existing callers and ad-hoc invocations
+ * still surface the warning. When a real emitter is wired we route through
+ * the event stream instead so the renderers own all user-facing output.
  */
-export function raceWithTimeout(label: string, p: Promise<void>, ms: number): Promise<void> {
+export function raceWithTimeout(
+  label: string,
+  p: Promise<void>,
+  ms: number,
+  emit: EventEmitter = nullEmitter,
+): Promise<void> {
+  const usingEmitter = emit !== nullEmitter;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<void>((resolve) => {
     timer = setTimeout(() => {
-      console.warn(`[gauntlet] ${label} did not complete within ${ms}ms; continuing.`);
+      const message = `${label} did not complete within ${ms}ms; continuing.`;
+      if (usingEmitter) emit({ type: "warn", message, context: "close", ts: Date.now() });
+      else console.warn(`[gauntlet] ${message}`);
       resolve();
     }, ms);
   });
   return Promise.race([
     p.catch((err) => {
-      console.warn(`[gauntlet] ${label} threw during close: ${err instanceof Error ? err.message : String(err)}`);
+      const detail = err instanceof Error ? err.message : String(err);
+      const message = `${label} threw during close: ${detail}`;
+      if (usingEmitter) emit({ type: "warn", message, context: "close", ts: Date.now() });
+      else console.warn(`[gauntlet] ${message}`);
     }),
     timeout,
   ]).finally(() => {
@@ -178,6 +257,13 @@ export interface VetOptions {
    * minutes holding chromium with no progress.
    */
   perFindingBudgetMs?: number;
+  /**
+   * Optional event emitter for narrating vetter progress in real time.
+   * Defaults to nullEmitter (silent). Wire the CLI's renderer-multiplex
+   * emitter here to surface per-URL navigate/axe boundaries, per-finding
+   * verdicts, and 5-second heartbeats during slow axe scans.
+   */
+  emit?: EventEmitter;
 }
 
 /**
@@ -212,6 +298,27 @@ export async function vetAll(findings: Finding[], opts: VetOptions = {}): Promis
   // 60s so a heavy SPA's axe scan can finish, but never indefinite.
   const perFindingBudgetMs = opts.perFindingBudgetMs ?? 60_000;
   const cwd = opts.cwd ?? process.cwd();
+  const emit = opts.emit ?? nullEmitter;
+  const vetStart = Date.now();
+
+  // Pre-group: count findings sharing each (url, surfaceId) key so the
+  // first vet_url_start we emit for a session can carry the total findings
+  // that will be served by it. Distinct sessionTotal is the unique-key count.
+  const findingsPerKey = new Map<string, number>();
+  for (const f of findings) {
+    if (f.replayStrategy === "none" || f.replayStrategy === "flow_replay") continue;
+    const key = `${f.url}|${f.surfaceId ?? ""}`;
+    findingsPerKey.set(key, (findingsPerKey.get(key) ?? 0) + 1);
+  }
+  const sessionTotal = findingsPerKey.size;
+  let sessionIndex = 0;
+
+  emit({
+    type: "vet_start",
+    total: findings.length,
+    distinctUrls: sessionTotal,
+    ts: Date.now(),
+  });
 
   // Resolve each finding's surface.auth_state once. Surfaces without
   // auth_state (or findings without surfaceId) get undefined and reuse
@@ -231,14 +338,19 @@ export async function vetAll(findings: Finding[], opts: VetOptions = {}): Promis
     }
   }
 
-  const browser: Browser = await chromium.launch({ headless });
+  const browser: Browser = await _launcher.launch({ headless });
   // Key sessions by (url, auth-state-path) so two findings from different
   // surfaces at the same URL don't get cross-contaminated cookies.
   const sessions = new Map<string, UrlSession>();
+  // Map sessionKey -> remaining findings count, so vet_url_start can report
+  // how many findings will be served by this session even though we group
+  // by (url, auth-state) which is a superset key of (url, surfaceId).
   const out: Finding[] = [];
+  let findingIndex = 0;
 
   try {
     for (const f of findings) {
+      findingIndex += 1;
       if (f.replayStrategy === "none" || f.replayStrategy === "flow_replay") {
         const v = vetFromSession(f, {
           context: null as never,
@@ -258,6 +370,15 @@ export async function vetAll(findings: Finding[], opts: VetOptions = {}): Promis
             ...(v.rePassed !== undefined ? { rePassed: v.rePassed } : {}),
           },
         });
+        emit({
+          type: "vet_finding",
+          findingIndex,
+          total: findings.length,
+          findingId: f.id,
+          status: v.status,
+          ...(f.axeRuleId ? { ruleId: f.axeRuleId } : {}),
+          ts: Date.now(),
+        });
         continue;
       }
       try {
@@ -265,9 +386,22 @@ export async function vetAll(findings: Finding[], opts: VetOptions = {}): Promis
         const sessionKey = `${f.url}|${authState ?? ""}`;
         let session = sessions.get(sessionKey);
         if (!session) {
+          sessionIndex += 1;
+          // findingCount: count of findings sharing this URL (independent of
+          // auth-state — close enough for a progress signal). Falls back to
+          // the per-key tally we computed above when the surfaceId is unset.
+          const fc = findingsPerKey.get(`${f.url}|${f.surfaceId ?? ""}`) ?? 1;
+          emit({
+            type: "vet_url_start",
+            url: f.url,
+            findingCount: fc,
+            sessionIndex,
+            sessionTotal,
+            ts: Date.now(),
+          });
           session = await withVetTimeout(
             `openSession(${f.url})`,
-            openSession(browser, f.url, timeoutMs, authState),
+            openSession(browser, f.url, timeoutMs, authState, emit),
             perFindingBudgetMs,
           );
           sessions.set(sessionKey, session);
@@ -281,6 +415,15 @@ export async function vetAll(findings: Finding[], opts: VetOptions = {}): Promis
             ...(v.rePassed !== undefined ? { rePassed: v.rePassed } : {}),
           },
         });
+        emit({
+          type: "vet_finding",
+          findingIndex,
+          total: findings.length,
+          findingId: f.id,
+          status: v.status,
+          ...(f.axeRuleId ? { ruleId: f.axeRuleId } : {}),
+          ts: Date.now(),
+        });
       } catch (err) {
         // Per-finding timeout (or any other openSession failure) — record as
         // could_not_replay and keep going. The session, if partially opened,
@@ -288,6 +431,12 @@ export async function vetAll(findings: Finding[], opts: VetOptions = {}): Promis
         // try/finally still reaps the browser at the end. Worth a follow-up
         // if vetter passes ever stretch into thousands of findings.
         const message = err instanceof Error ? err.message : String(err);
+        emit({
+          type: "warn",
+          message: `vetter failure on ${f.url}: ${message}`,
+          context: f.id,
+          ts: Date.now(),
+        });
         out.push({
           ...f,
           vetting: {
@@ -295,12 +444,51 @@ export async function vetAll(findings: Finding[], opts: VetOptions = {}): Promis
             note: `vetter failure: ${message}`,
           },
         });
+        emit({
+          type: "vet_finding",
+          findingIndex,
+          total: findings.length,
+          findingId: f.id,
+          status: "could_not_replay",
+          ...(f.axeRuleId ? { ruleId: f.axeRuleId } : {}),
+          ts: Date.now(),
+        });
       }
     }
   } finally {
-    for (const s of sessions.values()) await closeSession(s);
-    await closeBrowserBounded(browser);
+    for (const s of sessions.values()) await closeSession(s, emit);
+    await closeBrowserBounded(browser, emit);
   }
+
+  let verified = 0;
+  let regressed = 0;
+  let subjective = 0;
+  let couldNotReplay = 0;
+  for (const f of out) {
+    switch (f.vetting.status) {
+      case "verified":
+        verified += 1;
+        break;
+      case "regressed":
+        regressed += 1;
+        break;
+      case "subjective":
+        subjective += 1;
+        break;
+      case "could_not_replay":
+        couldNotReplay += 1;
+        break;
+    }
+  }
+  emit({
+    type: "vet_end",
+    verified,
+    regressed,
+    subjective,
+    couldNotReplay,
+    durationMs: Date.now() - vetStart,
+    ts: Date.now(),
+  });
 
   return out;
 }
@@ -311,8 +499,12 @@ export async function vetFinding(opts: { finding: Finding; headless?: boolean; t
     ...(opts.headless !== undefined ? { headless: opts.headless } : {}),
     ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
   });
+  // vetAll never assigns "unverified" — that status only appears on findings
+  // that were never run through the vetter. Cast to the narrowed VetResult
+  // status to keep the public type honest.
+  const status = vetted!.vetting.status as VetResult["status"];
   return {
-    status: vetted!.vetting.status,
+    status,
     note: vetted!.vetting.note ?? "",
     ...(vetted!.vetting.rePassed !== undefined ? { rePassed: vetted!.vetting.rePassed } : {}),
   };

@@ -106,6 +106,7 @@ export async function generateSurfaces(opts: GenerateSurfacesOptions): Promise<S
       "Object with 'surfaces' array. Each surface has id, name, base_url?, audience, features[], excluded_features[].",
     maxTokens: 4000,
     temperature: 0.6,
+    purpose: "surface_gen",
   });
 
   return result.surfaces as Surface[];
