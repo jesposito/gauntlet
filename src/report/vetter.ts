@@ -69,8 +69,44 @@ async function openSession(
   };
 }
 
+/**
+ * Bounded close, mirrors the discipline in src/runner/browser.ts. Without this
+ * an orphaned BrowserContext (e.g. parent chromium already terminated due to
+ * timeout / crash) can leave `context.close()` awaiting a Promise that never
+ * resolves, freezing the entire vet pass after axe work is complete. Real-world
+ * dogfood (audplexus 2026-05-14): 23-finding vetter hung 25+ minutes in
+ * post-vetAll close. We'd rather leak the OS handle than block forever.
+ */
+const CLOSE_TIMEOUT_MS = 8_000;
 async function closeSession(s: UrlSession): Promise<void> {
-  await s.context.close().catch(() => undefined);
+  await raceWithTimeout(`closeSession(${s.url})`, s.context.close(), CLOSE_TIMEOUT_MS);
+}
+
+async function closeBrowserBounded(browser: Browser): Promise<void> {
+  await raceWithTimeout("browser.close", browser.close(), CLOSE_TIMEOUT_MS);
+}
+
+/**
+ * Same shape as withVetTimeout below but swallow-on-timeout: close paths must
+ * not throw because the outer finally is still trying to release the next
+ * resource. A timed-out close is logged and we continue.
+ */
+export function raceWithTimeout(label: string, p: Promise<void>, ms: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<void>((resolve) => {
+    timer = setTimeout(() => {
+      console.warn(`[gauntlet] ${label} did not complete within ${ms}ms; continuing.`);
+      resolve();
+    }, ms);
+  });
+  return Promise.race([
+    p.catch((err) => {
+      console.warn(`[gauntlet] ${label} threw during close: ${err instanceof Error ? err.message : String(err)}`);
+    }),
+    timeout,
+  ]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
 }
 
 function vetFromSession(finding: Finding, s: UrlSession): VetResult {
@@ -263,7 +299,7 @@ export async function vetAll(findings: Finding[], opts: VetOptions = {}): Promis
     }
   } finally {
     for (const s of sessions.values()) await closeSession(s);
-    await browser.close().catch(() => undefined);
+    await closeBrowserBounded(browser);
   }
 
   return out;
