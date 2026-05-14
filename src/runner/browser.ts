@@ -117,7 +117,12 @@ export async function runPersona(opts: RunOptions): Promise<RunResult> {
       persona.behavior.device === "mobile",
     isMobile:
       persona.behavior.device === "mobile" || persona.behavior.device === "tablet",
-    recordVideo: { dir: join(runDir, "video") },
+    // Video off by default; mirrors flow-runner.ts. Codex audit 2026-05-14
+    // traced a 12-minute production hang to ffmpeg gracefulClose() with no
+    // internal deadline.
+    ...((opts as { recordVideo?: boolean }).recordVideo === true
+      ? { recordVideo: { dir: join(runDir, "video") } }
+      : {}),
     ...(opts.storageStatePath ? { storageState: opts.storageStatePath } : {}),
   });
 

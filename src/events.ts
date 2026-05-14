@@ -57,6 +57,29 @@ export type GauntletEvent =
       ts: number;
     }
 
+  // Setup-phase events — fire BEFORE the first step so silence during browser
+  // setup, navigation, or CDP wiring isn't indistinguishable from a hang.
+  // Codex audit 2026-05-14: a 12-min wedge during recordVideo init looked
+  // identical to a wedge during context creation in the event stream because
+  // setup was silent end-to-end.
+  | {
+      type: "setup_op_start";
+      personaId: string;
+      flowId: string;
+      op: "browser_launch" | "new_context" | "new_page" | "cdp_session" | "network_emulate" | "goto";
+      ts: number;
+    }
+  | {
+      type: "setup_op_end";
+      personaId: string;
+      flowId: string;
+      op: "browser_launch" | "new_context" | "new_page" | "cdp_session" | "network_emulate" | "goto";
+      durationMs: number;
+      ok: boolean;
+      error?: string;
+      ts: number;
+    }
+
   // Run-phase events — superset of FlowEvent. Adapter below converts.
   | {
       type: "flow_start";

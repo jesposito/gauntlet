@@ -5,6 +5,7 @@ import { chromium } from "playwright";
 import type { Persona } from "../persona/schema.ts";
 import type { Flow } from "../flow/schema.ts";
 import type { AiProvider } from "../ai/provider.ts";
+import { getGlobalEventEmitter } from "../ai/provider.ts";
 import { NETWORK_PROFILES } from "./network-profiles.ts";
 import {
   type CaptureContext,
@@ -133,6 +134,25 @@ export interface FlowRunOptions {
    * sub-second budgets; production code should not pass it.
    */
   wallclockBudgetMs?: number;
+  /**
+   * Opt-in WebM video recording via Playwright's recordVideo. Default OFF.
+   *
+   * Codex audit (2026-05-14) traced a 12-minute production hang on
+   * https://get-facet.com to ffmpeg's `gracefulClose()` in
+   * playwright-core/lib/server/videoRecorder.js (no internal deadline). The
+   * underlying `context.close()` await never returns when ffmpeg wedges, and
+   * `withTimeout(context.close(), 8s)` is `Promise.race` — it returns to OUR
+   * caller after 8s but the in-flight close keeps running and ffmpeg lives
+   * on inside the Bun process (Playwright launches ffmpeg from Node/Bun, NOT
+   * from Chromium, so `browser.close()` doesn't reap it).
+   *
+   * The artifacts that actually drive the report (screenshots, axe, ax-tree,
+   * DOM, console, network, flow-result.json) DO NOT depend on video. The
+   * report renderer treats video as optional. Operators who need WebM
+   * playback can opt back in via --record-video; ship-default is OFF so the
+   * tool feels rock solid.
+   */
+  recordVideo?: boolean;
 }
 
 export interface StepResult {
@@ -232,9 +252,63 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
   let wallclockAlarm: ReturnType<typeof setTimeout> | undefined;
   let wallclockFired = false;
 
+  // Per-op setup timeouts. Each op is bounded so silent setup hangs surface
+  // promptly through a thrown error (which the outer catch turns into
+  // outcome="error") rather than as an indefinite quiet wait. Codex audit
+  // 2026-05-14 found NO per-op timeouts here — a wedge during e.g. ffmpeg
+  // init looked identical to a wedge during goto in the event stream.
+  const SETUP_TIMEOUTS = {
+    browser_launch: 45_000,
+    new_context: 30_000,
+    new_page: 30_000,
+    cdp_session: 15_000,
+    network_emulate: 10_000,
+    goto: 60_000,
+  } as const;
+
+  // Pull the global emitter once. Setup events flow through here without
+  // requiring a wider FlowEventHandler refactor. CachingProvider already
+  // uses the same global emitter for ai_call_start/end.
+  const gemit = getGlobalEventEmitter();
+  function setupEvent(op: keyof typeof SETUP_TIMEOUTS, kind: "start" | "end", durationMs: number, ok: boolean, error?: string): void {
+    if (kind === "start") {
+      gemit({
+        type: "setup_op_start",
+        personaId: persona.id,
+        flowId: flow.id,
+        op,
+        ts: Date.now(),
+      });
+    } else {
+      gemit({
+        type: "setup_op_end",
+        personaId: persona.id,
+        flowId: flow.id,
+        op,
+        durationMs,
+        ok,
+        ...(error !== undefined ? { error } : {}),
+        ts: Date.now(),
+      });
+    }
+  }
+  async function setupOp<T>(op: keyof typeof SETUP_TIMEOUTS, work: Promise<T>): Promise<T> {
+    const startedAt = Date.now();
+    setupEvent(op, "start", 0, true);
+    try {
+      const result = await withTimeout(work, SETUP_TIMEOUTS[op], `setup:${op}`);
+      setupEvent(op, "end", Date.now() - startedAt, true);
+      return result;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setupEvent(op, "end", Date.now() - startedAt, false, msg.slice(0, 120));
+      throw err;
+    }
+  }
+
   try {
 
-  browser = await chromium.launch({ headless });
+  browser = await setupOp("browser_launch", chromium.launch({ headless }));
   wallclockAlarm = setTimeout(() => {
     wallclockFired = true;
     // Best-effort force-close. Even if these reject, the in-flight ops
@@ -244,7 +318,7 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
     browser?.close().catch(() => undefined);
   }, wallclockBudgetMs);
   const ua = DEVICE_USER_AGENTS[persona.behavior.device] ?? DEVICE_USER_AGENTS.desktop!;
-  context = await browser.newContext({
+  context = await setupOp("new_context", browser.newContext({
     viewport: persona.behavior.viewport,
     userAgent: ua,
     hasTouch:
@@ -253,9 +327,14 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
       persona.behavior.device === "mobile",
     isMobile:
       persona.behavior.device === "mobile" || persona.behavior.device === "tablet",
-    recordVideo: { dir: join(runDir, "video") },
+    // Video off by default — Playwright's ffmpeg `gracefulClose()` has no
+    // internal deadline and can wedge the entire Bun process. Opt-in via
+    // FlowRunOptions.recordVideo.
+    ...(opts.recordVideo === true
+      ? { recordVideo: { dir: join(runDir, "video") } }
+      : {}),
     ...(opts.storageStatePath ? { storageState: opts.storageStatePath } : {}),
-  });
+  }));
 
   const netProfile = NETWORK_PROFILES[persona.behavior.network];
   if (!netProfile) {
@@ -264,7 +343,7 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
     throw new Error(`unknown network profile: ${persona.behavior.network}`);
   }
 
-  const page = await context.newPage();
+  const page = await setupOp("new_page", context.newPage());
   // Scale Playwright's default action/navigation timeouts with the persona's
   // network profile so a slow-3g persona doesn't fail every selector lookup
   // at the 30s default. Floor 30s, cap 90s.
@@ -272,13 +351,16 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
   const scaledDefaultTimeout = Math.min(90_000, Math.max(30_000, 30_000 * networkSlowdown));
   page.setDefaultTimeout(scaledDefaultTimeout);
   page.setDefaultNavigationTimeout(scaledDefaultTimeout);
-  const cdp = await context.newCDPSession(page);
-  await cdp.send("Network.emulateNetworkConditions", {
-    offline: netProfile.offline,
-    latency: netProfile.latencyMs,
-    downloadThroughput: netProfile.downloadBps,
-    uploadThroughput: netProfile.uploadBps,
-  });
+  const cdp = await setupOp("cdp_session", context.newCDPSession(page));
+  await setupOp(
+    "network_emulate",
+    cdp.send("Network.emulateNetworkConditions", {
+      offline: netProfile.offline,
+      latency: netProfile.latencyMs,
+      downloadThroughput: netProfile.downloadBps,
+      uploadThroughput: netProfile.uploadBps,
+    }),
+  );
 
   const consoleLog: string[] = [];
   const networkLog: NetworkEntry[] = [];
@@ -363,7 +445,7 @@ export async function runFlow(opts: FlowRunOptions): Promise<FlowRunResult> {
   ];
 
   try {
-    await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
+    await setupOp("goto", page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: 30_000 }).then(() => undefined));
     // SPAs render a near-empty shell at DOMContentLoaded and only hydrate
     // after JS runs. networkidle is unreliable for apps that poll (analytics,
     // telemetry, websockets) — DOM-mutation settle is more robust.
