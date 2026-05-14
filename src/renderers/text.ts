@@ -81,6 +81,39 @@ export function createTextRenderer(opts: TextRendererOptions = {}): (e: Gauntlet
     return c;
   }
 
+  // Stable persona short-label assignment with collision disambiguation.
+  // Real-world dogfood (facets-sh 2026-05-14): first-segment shortname
+  // collapsed `marketing-commuter-prospect` and `marketing-skeptical-creator`
+  // both to `[marketing]`, defeating per-persona attribution. Color still
+  // disambiguated but the label was wrong. Strategy: take the LAST segment
+  // (almost always the most distinctive — "prospect", "creator", "newcomer"
+  // — since persona IDs typically follow `<surface>-<role>-<descriptor>`).
+  // On collision with an already-seen persona, fall through to last-2,
+  // last-3, then the full id (capped at 16 chars).
+  const personaIdToShort = new Map<string, string>();
+  function shortNameFor(personaId: string): string {
+    const cached = personaIdToShort.get(personaId);
+    if (cached !== undefined) return cached;
+    const segs = personaId.split("-").filter(Boolean);
+    const candidates = [
+      segs[segs.length - 1],
+      segs.slice(-2).join("-"),
+      segs.slice(-3).join("-"),
+      personaId,
+    ].filter((c): c is string => typeof c === "string" && c.length > 0);
+    const taken = new Set(personaIdToShort.values());
+    let chosen = personaId;
+    for (const c of candidates) {
+      if (!taken.has(c)) {
+        chosen = c;
+        break;
+      }
+    }
+    if (chosen.length > 16) chosen = chosen.slice(0, 15) + "…";
+    personaIdToShort.set(personaId, chosen);
+    return chosen;
+  }
+
   function paint(text: string, ansi: string): string {
     if (!color) return text;
     return `\x1b[${ansi}m${text}${ANSI.reset}`;
@@ -248,7 +281,7 @@ export function createTextRenderer(opts: TextRendererOptions = {}): (e: Gauntlet
         if (quiet) return;
         const c = colorForPersona(e.personaId);
         writeLine(
-          `  ${paint(`[${shortName(e.personaId)}]`, c)} ${e.flowId}  START (${e.totalSteps} step${e.totalSteps === 1 ? "" : "s"})`,
+          `  ${paint(`[${shortNameFor(e.personaId)}]`, c)} ${e.flowId}  START (${e.totalSteps} step${e.totalSteps === 1 ? "" : "s"})`,
         );
         return;
       }
@@ -257,7 +290,7 @@ export function createTextRenderer(opts: TextRendererOptions = {}): (e: Gauntlet
         if (quiet) return;
         const c = colorForPersona(e.personaId);
         writeLine(
-          `  ${paint(`[${shortName(e.personaId)}]`, c)} step ${e.stepIndex + 1}: ${truncate(e.intent, 80)}`,
+          `  ${paint(`[${shortNameFor(e.personaId)}]`, c)} step ${e.stepIndex + 1}: ${truncate(e.intent, 80)}`,
         );
         return;
       }
@@ -266,7 +299,7 @@ export function createTextRenderer(opts: TextRendererOptions = {}): (e: Gauntlet
         if (quiet) return;
         const c = colorForPersona(e.personaId);
         const verdict = e.matched ? paint("MATCH", "32") : paint("NO MATCH", "31");
-        writeLine(`    ${paint(`[${shortName(e.personaId)}]`, c)} observe -> ${verdict}: ${truncate(e.reasoning, 90)}`);
+        writeLine(`    ${paint(`[${shortNameFor(e.personaId)}]`, c)} observe -> ${verdict}: ${truncate(e.reasoning, 90)}`);
         return;
       }
 
@@ -277,7 +310,7 @@ export function createTextRenderer(opts: TextRendererOptions = {}): (e: Gauntlet
         const target = e.targetName ? ` "${truncate(e.targetName, 40)}"` : "";
         const err = e.error ? ` err=${truncate(e.error, 60)}` : "";
         writeLine(
-          `    ${paint(`[${shortName(e.personaId)}]`, c)} act -> ${status} ${e.action ?? "?"}${target}${err}`,
+          `    ${paint(`[${shortNameFor(e.personaId)}]`, c)} act -> ${status} ${e.action ?? "?"}${target}${err}`,
         );
         return;
       }
@@ -292,7 +325,7 @@ export function createTextRenderer(opts: TextRendererOptions = {}): (e: Gauntlet
               ? paint("in_progress", "33")
               : paint("give_up", "31");
         writeLine(
-          `    ${paint(`[${shortName(e.personaId)}]`, c)} verdict=${v}: ${truncate(e.evidence, 90)}`,
+          `    ${paint(`[${shortNameFor(e.personaId)}]`, c)} verdict=${v}: ${truncate(e.evidence, 90)}`,
         );
         return;
       }
@@ -302,7 +335,7 @@ export function createTextRenderer(opts: TextRendererOptions = {}): (e: Gauntlet
         const c = colorForPersona(e.personaId);
         const o = paint(e.outcome, e.outcome === "completed" ? "32" : "33");
         writeLine(
-          `  ${paint(`[${shortName(e.personaId)}]`, c)} ${e.flowId}  END outcome=${o} duration=${(e.durationMs / 1000).toFixed(1)}s`,
+          `  ${paint(`[${shortNameFor(e.personaId)}]`, c)} ${e.flowId}  END outcome=${o} duration=${(e.durationMs / 1000).toFixed(1)}s`,
         );
         return;
       }
@@ -327,12 +360,6 @@ export function createTextRenderer(opts: TextRendererOptions = {}): (e: Gauntlet
       }
     }
   };
-}
-
-function shortName(id: string): string {
-  // Use the first segment of a kebab-id, capped to 12 chars.
-  const seg = id.split("-")[0] ?? id;
-  return seg.length > 12 ? seg.slice(0, 12) : seg;
 }
 
 function truncate(s: string, n: number): string {

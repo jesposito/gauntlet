@@ -80,14 +80,22 @@ export type StepVerdict = z.infer<typeof StepVerdictSchema>;
 /**
  * Permissive raw shape used to parse AI output before normalizing into the
  * strict StepVerdictSchema above. Optional fields here account for known
- * provider sloppiness (omitted give_up_class on give_up verdicts, missing
- * give_up_reason). Normalization fills the gaps so the rest of the codebase
- * sees the strict discriminated union.
+ * provider sloppiness:
+ *   - give_up_class omitted on give_up verdicts (audplexus 2026-05-13, 4/4)
+ *   - give_up_reason omitted on give_up verdicts
+ *   - give_up_reason / give_up_class explicitly null on success/in_progress
+ *     verdicts (facets-sh 2026-05-14: AI returned `{"status":"success",
+ *     "evidence":"...","give_up_reason":null,"give_up_class":null}`, schema
+ *     rejected because `.optional()` doesn't accept `null` — the call escaped
+ *     as outcome="error" instead of being treated as a normal success)
+ *
+ * `.nullish()` accepts both `undefined` and `null`. Normalization collapses
+ * both to the strict shape.
  */
 export const RawStepVerdictSchema = z.object({
   status: z.enum(["success", "in_progress", "give_up"]),
-  give_up_reason: z.string().optional(),
-  give_up_class: GiveUpClassSchema.optional(),
+  give_up_reason: z.string().nullish(),
+  give_up_class: GiveUpClassSchema.nullish(),
   evidence: z.string(),
 });
 
@@ -98,8 +106,11 @@ export type RawStepVerdict = z.infer<typeof RawStepVerdictSchema>;
  * give_up verdicts, missing give_up_class defaults to "bug" so we never
  * silently suppress a real defect (real-world dogfood: audplexus 2026-05-13,
  * 4/4 abandoned flows came back with no give_up_class), and missing
- * give_up_reason defaults to the evidence text. Exported for tests; runtime
- * consumers should depend on the strict StepVerdict shape only.
+ * give_up_reason defaults to the evidence text. For success / in_progress
+ * verdicts, any give_up_* fields the AI hallucinated are stripped (facets-sh
+ * 2026-05-14: AI sent give_up_reason: null on a success verdict).
+ * Exported for tests; runtime consumers should depend on the strict
+ * StepVerdict shape only.
  */
 export function normalizeVerdict(raw: RawStepVerdict): StepVerdict {
   if (raw.status === "give_up") {

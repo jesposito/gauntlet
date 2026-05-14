@@ -91,8 +91,9 @@ describe("text renderer (non-TTY mode = CI/piped output)", () => {
       performed: true,
       ts: 1,
     });
-    expect(buf.raw()).toContain("[marcus]");
-    expect(buf.raw()).toContain("[priya]");
+    // Last-segment strategy: distinctive descriptor over surface prefix.
+    expect(buf.raw()).toContain("[conductor]");
+    expect(buf.raw()).toContain("[newcomer]");
   });
 
   test("quiet mode suppresses per-step detail but keeps phase headers", () => {
@@ -116,5 +117,53 @@ describe("text renderer (non-TTY mode = CI/piped output)", () => {
     const r = createTextRenderer({ isTTY: false, color: false, out: buf });
     r({ type: "warn", message: "heads up", ts: 1 });
     expect(buf.raw()).not.toMatch(/\x1b\[/);
+  });
+
+  test("persona shortname disambiguates collisions on first segment", () => {
+    // facets-sh dogfood (2026-05-14): both `marketing-commuter-prospect` and
+    // `marketing-skeptical-creator` collapsed to `[marketing]` pre-fix. The
+    // last-segment strategy gives them distinct, descriptive labels.
+    const buf = makeBuffer();
+    const r = createTextRenderer({ isTTY: false, color: false, out: buf });
+    r({
+      type: "flow_start",
+      personaId: "marketing-commuter-prospect",
+      flowId: "f",
+      totalSteps: 1,
+      ts: 1,
+    });
+    r({
+      type: "flow_start",
+      personaId: "marketing-skeptical-creator",
+      flowId: "g",
+      totalSteps: 1,
+      ts: 1,
+    });
+    expect(buf.raw()).toContain("[prospect]");
+    expect(buf.raw()).toContain("[creator]");
+    expect(buf.raw()).not.toMatch(/\[marketing\]/);
+  });
+
+  test("persona shortname falls through to last-2 segments on actual collision", () => {
+    // Two personas with the same last segment ("creator"). The second one
+    // gets "skeptical-creator" so per-persona attribution stays honest.
+    const buf = makeBuffer();
+    const r = createTextRenderer({ isTTY: false, color: false, out: buf });
+    r({
+      type: "flow_start",
+      personaId: "marketing-skeptical-creator",
+      flowId: "f",
+      totalSteps: 1,
+      ts: 1,
+    });
+    r({
+      type: "flow_start",
+      personaId: "tenant-admin-busy-creator",
+      flowId: "g",
+      totalSteps: 1,
+      ts: 1,
+    });
+    expect(buf.raw()).toContain("[creator]");
+    expect(buf.raw()).toContain("[busy-creator]");
   });
 });
