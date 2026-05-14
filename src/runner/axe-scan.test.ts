@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, mock, test } from "bun:test";
 import {
   PERSONA_RULE_TO_AXE_ID,
   matchAxeViolationsToPersonaRules,
@@ -43,5 +43,91 @@ describe("matchAxeViolationsToPersonaRules", () => {
     ];
     const hits = matchAxeViolationsToPersonaRules(v, ["unlabeled_icon_buttons", "form_field_missing_label"]);
     expect(hits.map((h) => h.axeId).sort()).toEqual(["button-name", "label"]);
+  });
+});
+
+/**
+ * Contract tests for runAxe's timeout + signal behavior. AxeBuilder.analyze
+ * is NOT internally cancelable (per the doc comment on runAxe), so these
+ * tests lock the OBSERVABLE contract: caller-side bounding works, and
+ * timeouts/aborts surface as `error` on the result rather than throwing.
+ *
+ * The whole-file `mock.module` swap is hoisted; each test rebinds
+ * `analyzeImpl` to control whether AxeBuilder.analyze() resolves, hangs,
+ * or throws. Pattern mirrors flow-runner.test.ts's `currentStub` shape.
+ */
+
+let analyzeImpl: () => Promise<unknown> = async () => ({
+  violations: [],
+  passes: [],
+  incomplete: [],
+  inapplicable: [],
+});
+mock.module("@axe-core/playwright", () => ({
+  AxeBuilder: class {
+    withTags() {
+      return this;
+    }
+    analyze() {
+      return analyzeImpl();
+    }
+  },
+}));
+
+describe("runAxe — timeout + signal contract", () => {
+  test("successful analyze returns parsed violations and zero error", async () => {
+    analyzeImpl = async () => ({
+      violations: [
+        {
+          id: "label",
+          impact: "serious",
+          help: "Form elements must have labels",
+          helpUrl: "https://example.com/label",
+          nodes: [{ target: ["input#x"], html: "<input id=x>" }],
+        },
+      ],
+      passes: [{}, {}],
+      incomplete: [],
+      inapplicable: [{}],
+    });
+    const { runAxe } = await import("./axe-scan.ts");
+    const fakePage = { url: () => "https://example.com/" } as never;
+    const result = await runAxe(fakePage);
+    expect(result.error).toBeUndefined();
+    expect(result.violations).toHaveLength(1);
+    expect(result.violations[0]?.id).toBe("label");
+    expect(result.passes).toBe(2);
+    expect(result.inapplicable).toBe(1);
+  });
+
+  test("caller-supplied AbortSignal aborts pending analyze with surfaced error", async () => {
+    analyzeImpl = () => new Promise<never>(() => {});
+    const { runAxe } = await import("./axe-scan.ts");
+    const fakePage = {
+      url: () => "https://example.com/",
+      evaluate: async () => undefined,
+    } as never;
+    const controller = new AbortController();
+    const start = Date.now();
+    const p = runAxe(fakePage, controller.signal);
+    setTimeout(() => controller.abort(), 50);
+    const result = await p;
+    const elapsed = Date.now() - start;
+    expect(elapsed).toBeLessThan(2_000);
+    expect(result.error).toContain("aborted");
+    expect(result.violations).toHaveLength(0);
+  }, 5_000);
+
+  test("pre-aborted signal short-circuits with error", async () => {
+    analyzeImpl = () => new Promise<never>(() => {});
+    const { runAxe } = await import("./axe-scan.ts");
+    const fakePage = {
+      url: () => "https://example.com/",
+      evaluate: async () => undefined,
+    } as never;
+    const controller = new AbortController();
+    controller.abort();
+    const result = await runAxe(fakePage, controller.signal);
+    expect(result.error).toContain("aborted");
   });
 });

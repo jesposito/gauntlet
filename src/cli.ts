@@ -8,6 +8,7 @@ import {
 } from "./persona/loader.ts";
 import { runPersona } from "./runner/browser.ts";
 import { runFlow } from "./runner/flow-runner.ts";
+import { runFlowSupervised } from "./runner/flow-supervisor.ts";
 import { runWithConcurrency } from "./util/pool.ts";
 import {
   loadAllSurfacesWithDiagnostics,
@@ -216,6 +217,13 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
   );
   const quiet = args.flags.quiet === true;
   const noColor = args.flags["no-color"] === true;
+  const recordVideo = args.flags["record-video"] === true;
+  // Supervisor (per-flow subprocess + silence watchdog) is ON by default.
+  // Codex audit 2026-05-14 mandated belt-and-braces — even with the in-runner
+  // wallclock + per-op timeouts in place, ffmpeg / browser subprocesses can
+  // outlive Promise.race-based timeouts and wedge the bun process. Pass
+  // --no-supervisor to fall back to in-process runFlow (debug only).
+  const supervised = args.flags["no-supervisor"] !== true;
   const eventsLog =
     typeof args.flags["events-log"] === "string"
       ? args.flags["events-log"]
@@ -411,17 +419,36 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
     for (const flow of flows) {
       const runDir = join(baseDir, persona.id, flow.id);
       try {
-        const result = await runFlow({
-          url,
-          persona,
-          flow,
-          provider: getProvider(),
-          runDir,
-          headless,
-          onEvent: onFlowEvent,
-          ...(storageStatePath ? { storageStatePath } : {}),
-          ...(surfaceId ? { surfaceId } : {}),
-        });
+        const result = supervised
+          ? await runFlowSupervised(
+              {
+                url,
+                persona,
+                flow,
+                runDir,
+                headless,
+                recordVideo,
+                providerName: getProvider().name,
+                model,
+                cacheEnabled,
+                cacheDir: cwd,
+                ...(storageStatePath ? { storageStatePath } : {}),
+                ...(surfaceId ? { surfaceId } : {}),
+              },
+              { emit, onFlowEvent },
+            )
+          : await runFlow({
+              url,
+              persona,
+              flow,
+              provider: getProvider(),
+              runDir,
+              headless,
+              onEvent: onFlowEvent,
+              recordVideo,
+              ...(storageStatePath ? { storageStatePath } : {}),
+              ...(surfaceId ? { surfaceId } : {}),
+            });
         totalFailures += result.failures.length;
         outcomes.push(result.outcome);
       } catch (err) {
@@ -525,7 +552,12 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
       label: "building report (vetting layer re-runs replays)",
       ts: reportStartedAt,
     });
-    const built = await buildReport({ runDir: baseDir, vet: true });
+    // Pass `emit` so the vetter heartbeat (vet_url_axe_start/end, vet_finding,
+    // heartbeat) actually reaches the user. Codex audit 2026-05-14 caught
+    // that this call site dropped emit: tests passed because they passed
+    // emit directly, but production runs left users staring at silent terminals
+    // for the duration of vet (the felt-bad "25-min black box" from yesterday).
+    const built = await buildReport({ runDir: baseDir, vet: true, emit });
     emit({
       type: "phase_end",
       phase: "report",
@@ -563,7 +595,8 @@ async function cmdReport(args: ParsedArgs): Promise<void> {
     label: skipVet ? "synthesizing report (vetting disabled)" : "synthesizing report + vetting",
     ts: reportStartedAt,
   });
-  const built = await buildReport({ runDir: target, vet: !skipVet });
+  // Pass `emit` so vetter heartbeat reaches the user (codex audit 2026-05-14).
+  const built = await buildReport({ runDir: target, vet: !skipVet, emit });
   emit({
     type: "phase_end",
     phase: "report",
@@ -1421,6 +1454,17 @@ run misc:
   --no-color            disable ANSI color in text renderer (NO_COLOR env honored too)
   --events-log <path>   append every event to this JSONL file. tail -f to drive
                         gauntlet from an agent (Claude) in real time.
+  --record-video        opt in to Playwright WebM video recording per flow.
+                        Default OFF — Playwright's ffmpeg gracefulClose has
+                        no internal deadline and has wedged production runs
+                        for 12+ minutes. Screenshots, axe, and DOM artifacts
+                        do not depend on this flag.
+  --no-supervisor       run flows in-process instead of as a supervised
+                        subprocess (debug only). Default ON — each flow runs
+                        in its own detached process group with a parent-side
+                        silence watchdog (~75s) that SIGKILLs the entire
+                        tree if the worker goes silent, guaranteeing no flow
+                        can wedge the gauntlet binary indefinitely.
 
 run examples:
   gauntlet run --url https://staging.example.com --features checkout

@@ -4,6 +4,10 @@ import type { Persona } from "../persona/schema.ts";
 import { FlowSchema, type Flow } from "../flow/schema.ts";
 import { type ProjectContext, summarizeProject } from "./project-reader.ts";
 import type { Surface } from "../surface/schema.ts";
+import {
+  INIT_AI_TIMEOUT_MS,
+  withCancellableTimeout,
+} from "../ai/with-cancellable-timeout.ts";
 
 const FlowSetSchema = z.object({
   flows: z.array(FlowSchema).min(1).max(6),
@@ -70,6 +74,11 @@ export interface GenerateFlowsOptions {
    * lead — focus is a steering hint, not an override.
    */
   focus?: string;
+  /**
+   * Per-AI-call timeout in ms. Defaults to INIT_AI_TIMEOUT_MS (120s).
+   * Test-only seam — production code should not pass this.
+   */
+  timeoutMs?: number;
 }
 
 function personaToPrompt(persona: Persona): string {
@@ -124,19 +133,26 @@ DO NOT propose flows that reference features in "NOT available". The persona can
     .filter(Boolean)
     .join("\n\n");
 
-  const result = await opts.provider.propose({
-    messages: [
-      { role: "system", content: SYSTEM_PROMPT },
-      { role: "user", content: userPrompt },
-    ],
-    schema: FlowSetSchema,
-    schemaName: "FlowSet",
-    schemaDescription:
-      "Object with 'flows' array. Each flow has id, persona_id, title, goal, optional starting_url_hint, steps[], rationale.",
-    maxTokens: 6000,
-    temperature: 0.7,
-    purpose: "flow_gen",
-  });
+  const timeoutMs = opts.timeoutMs ?? INIT_AI_TIMEOUT_MS;
+  const result = await withCancellableTimeout(
+    (signal) =>
+      opts.provider.propose({
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          { role: "user", content: userPrompt },
+        ],
+        schema: FlowSetSchema,
+        schemaName: "FlowSet",
+        schemaDescription:
+          "Object with 'flows' array. Each flow has id, persona_id, title, goal, optional starting_url_hint, steps[], rationale.",
+        maxTokens: 6000,
+        temperature: 0.7,
+        purpose: "flow_gen",
+        signal,
+      }),
+    timeoutMs,
+    "init AI call flow_gen",
+  );
 
   return result.flows.map((f) => ({ ...f, persona_id: opts.persona.id })) as Flow[];
 }

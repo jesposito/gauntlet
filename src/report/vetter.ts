@@ -54,81 +54,107 @@ async function openSession(
   storageStatePath: string | undefined,
   emit: EventEmitter,
 ): Promise<UrlSession> {
-  const context = await browser.newContext(
-    storageStatePath ? { storageState: storageStatePath } : {},
-  );
-  const page = await context.newPage();
-  const consoleErrors: string[] = [];
-  let saw5xx = false;
-  page.on("console", (m) => {
-    if (m.type() === "error") consoleErrors.push(m.text());
-  });
-  page.on("response", (r) => {
-    if (r.status() >= 500) saw5xx = true;
-  });
-
-  let navigatedOk = true;
-  let navError: string | undefined;
-  const navStart = Date.now();
+  // Track the partially-opened context so any throw between newContext and
+  // the final return releases it. Without this, an axe failure (or any
+  // post-newContext throw) would leak the BrowserContext until vetAll's
+  // shared browser.close() reaped it at the end — pre-fix the per-finding
+  // catch in vetAll only saw the error and never the orphan context.
+  let context: BrowserContext | undefined;
   try {
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: timeoutMs });
-    await page.waitForTimeout(800);
-  } catch (err) {
-    navigatedOk = false;
-    navError = err instanceof Error ? err.message : String(err);
-  }
-  emit({
-    type: "vet_url_navigate",
-    url,
-    durationMs: Date.now() - navStart,
-    ok: navigatedOk,
-    ts: Date.now(),
-  });
+    context = await browser.newContext(
+      storageStatePath ? { storageState: storageStatePath } : {},
+    );
+    const page = await context.newPage();
+    const consoleErrors: string[] = [];
+    let saw5xx = false;
+    page.on("console", (m) => {
+      if (m.type() === "error") consoleErrors.push(m.text());
+    });
+    page.on("response", (r) => {
+      if (r.status() >= 500) saw5xx = true;
+    });
 
-  let axeRuleIds = new Set<string>();
-  if (navigatedOk) {
-    emit({ type: "vet_url_axe_start", url, ts: Date.now() });
-    const axeStart = Date.now();
-    // Heartbeat every 5s during axe so non-TTY consumers (Claude tailing
-    // JSONL, CI logs) see explicit "still alive" signals during slow scans.
-    // unref() so the timer never keeps the loop alive on its own.
-    const heartbeat = setInterval(() => {
-      emit({
-        type: "heartbeat",
-        phase: "vet",
-        label: `axe scan ${url}`,
-        elapsedMs: Date.now() - axeStart,
-        ts: Date.now(),
-      });
-    }, 5_000);
-    if (typeof heartbeat.unref === "function") heartbeat.unref();
-    let violationCount = 0;
+    let navigatedOk = true;
+    let navError: string | undefined;
+    const navStart = Date.now();
     try {
-      const axe = await _runAxe(page);
-      axeRuleIds = new Set(axe.violations.map((v) => v.id));
-      violationCount = axe.violations.length;
-    } finally {
-      clearInterval(heartbeat);
-      emit({
-        type: "vet_url_axe_end",
-        url,
-        violationCount,
-        durationMs: Date.now() - axeStart,
-        ts: Date.now(),
-      });
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: timeoutMs });
+      await page.waitForTimeout(800);
+    } catch (err) {
+      navigatedOk = false;
+      navError = err instanceof Error ? err.message : String(err);
     }
-  }
+    emit({
+      type: "vet_url_navigate",
+      url,
+      durationMs: Date.now() - navStart,
+      ok: navigatedOk,
+      ts: Date.now(),
+    });
 
-  return {
-    context,
-    page,
-    url,
-    consoleErrors,
-    saw5xx,
-    axeRuleIds,
-    navigatedOk,
-    navError,
-  };
+    let axeRuleIds = new Set<string>();
+    if (navigatedOk) {
+      emit({ type: "vet_url_axe_start", url, ts: Date.now() });
+      const axeStart = Date.now();
+      // Heartbeat every 5s during axe so non-TTY consumers (Claude tailing
+      // JSONL, CI logs) see explicit "still alive" signals during slow scans.
+      // unref() so the timer never keeps the loop alive on its own.
+      const heartbeat = setInterval(() => {
+        emit({
+          type: "heartbeat",
+          phase: "vet",
+          label: `axe scan ${url}`,
+          elapsedMs: Date.now() - axeStart,
+          ts: Date.now(),
+        });
+      }, 5_000);
+      if (typeof heartbeat.unref === "function") heartbeat.unref();
+      let violationCount = 0;
+      try {
+        const axe = await _runAxe(page);
+        axeRuleIds = new Set(axe.violations.map((v) => v.id));
+        violationCount = axe.violations.length;
+      } finally {
+        clearInterval(heartbeat);
+        emit({
+          type: "vet_url_axe_end",
+          url,
+          violationCount,
+          durationMs: Date.now() - axeStart,
+          ts: Date.now(),
+        });
+      }
+    }
+
+    const session: UrlSession = {
+      context,
+      page,
+      url,
+      consoleErrors,
+      saw5xx,
+      axeRuleIds,
+      navigatedOk,
+      navError,
+    };
+    // Hand ownership of `context` to the returned session — clear local ref
+    // so the catch below doesn't release a context the caller now owns.
+    context = undefined;
+    return session;
+  } catch (err) {
+    if (context) {
+      // Best-effort release of the partial context. Never throw — the outer
+      // catch is already handling a primary failure (timeout / axe blow-up /
+      // newPage error). A leaked OS handle is preferable to masking the real
+      // error with a close-time exception.
+      await raceWithTimeout(
+        `openSession.cleanup(${url})`,
+        context.close(),
+        CLOSE_TIMEOUT_MS,
+        emit,
+      );
+    }
+    throw err;
+  }
 }
 
 /**

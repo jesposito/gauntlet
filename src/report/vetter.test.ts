@@ -268,6 +268,49 @@ describe("vetAll event emission", () => {
     expect(finding.status).toBe("could_not_replay");
   });
 
+  // Codex audit 2026-05-14, finding #3. Pre-fix, when openSession threw
+  // partway through (e.g. axe blew up after newContext succeeded), the
+  // partially-opened BrowserContext was held until vetAll's outer
+  // browser.close() at the end of the call. The fix wraps openSession in
+  // try/catch and best-effort closes the partial context before re-throwing.
+  test("openSession releases partial context when axe throws (no leak)", async () => {
+    const closedContexts: string[] = [];
+    const fakePage = {
+      on: () => fakePage,
+      goto: async () => null,
+      waitForTimeout: async () => undefined,
+    } as const;
+    let contextSeq = 0;
+    const browser = {
+      newContext: async () => {
+        const id = `ctx-${++contextSeq}`;
+        return {
+          newPage: async () => fakePage,
+          close: async () => {
+            closedContexts.push(id);
+          },
+        };
+      },
+      close: async () => undefined,
+    };
+    _setBrowserLauncherForTesting({ launch: async () => browser as never });
+    _setAxeRunnerForTesting(async () => {
+      throw new Error("axe blew up partway through");
+    });
+
+    await vetAll([baseFinding({ id: "f1", url: "https://leak.test/" })], {
+      // Default 60s budget would normally let the work complete; here axe
+      // throws synchronously so we don't risk timing flake.
+      emit: () => undefined,
+    });
+
+    // Partial context must be released by openSession's catch — not deferred
+    // to vetAll's final close. Pre-fix this array was empty until the outer
+    // browser teardown reaped everything implicitly.
+    expect(closedContexts.length).toBeGreaterThanOrEqual(1);
+    expect(closedContexts[0]).toBe("ctx-1");
+  });
+
   test("vet_start carries total + distinctUrls; sessionTotal aggregates by url+surface", async () => {
     const { browser } = makeFakeBrowser();
     _setBrowserLauncherForTesting({ launch: async () => browser as never });

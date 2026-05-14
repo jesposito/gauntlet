@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   buildCrossSurface,
   buildCrossSurfaceReport,
+  closeWithTimeout,
   type SurfaceRun,
 } from "./cross-surface.ts";
 import type { RunReport } from "./schema.ts";
@@ -209,3 +210,69 @@ describe("buildCrossSurfaceReport - schema validation at disk boundary", () => {
     expect(warnMsg).toContain("report.json");
   });
 });
+
+// --------------------------------------------------------------------------
+// Bounded close (codex audit 2026-05-14, finding #1).
+//
+// Pre-fix vetCrossSurfacePatterns had unbounded `context.close().catch()` and
+// `browser.close().catch()`. If Playwright hung in close (ffmpeg-style stuck
+// graceful shutdown), the cross-surface vetting blocked indefinitely. The fix
+// wraps both in closeWithTimeout (8s budget, swallow-on-timeout). These tests
+// pin both halves of the contract: success cases pass through quickly, hangs
+// resolve when the timer fires.
+// --------------------------------------------------------------------------
+
+describe("closeWithTimeout", () => {
+  test("resolves cleanly when underlying close succeeds before deadline", async () => {
+    const start = Date.now();
+    await closeWithTimeout("ok", Promise.resolve(), 1_000);
+    expect(Date.now() - start).toBeLessThan(500);
+  });
+
+  test("resolves (does not throw) when close hangs past the budget", async () => {
+    const stuck = new Promise<void>(() => {
+      /* never resolves — simulates Playwright stuck in close */
+    });
+    const warnings: string[] = [];
+    const orig = console.warn;
+    console.warn = (msg: string) => {
+      warnings.push(msg);
+    };
+    try {
+      const start = Date.now();
+      await closeWithTimeout("stuck-close", stuck, 30);
+      const elapsed = Date.now() - start;
+      // Resolved on the timer, not the never-settling promise.
+      expect(elapsed).toBeLessThan(500);
+      expect(elapsed).toBeGreaterThanOrEqual(20);
+    } finally {
+      console.warn = orig;
+    }
+  });
+
+  test("warns and resolves when underlying close throws", async () => {
+    const warnings: string[] = [];
+    const orig = console.warn;
+    console.warn = (msg: string) => {
+      warnings.push(msg);
+    };
+    try {
+      await closeWithTimeout(
+        "error-close",
+        Promise.reject(new Error("orphan context")),
+        1_000,
+      );
+      expect(
+        warnings.some((w) => /error-close threw during close: orphan context/.test(w)),
+      ).toBe(true);
+    } finally {
+      console.warn = orig;
+    }
+  });
+});
+
+// Integration coverage — that vetCrossSurfacePatterns survives a hung
+// browser.close() — would require an 8s wallclock per assertion (the default
+// budget). We instead trust the closeWithTimeout unit tests above for the
+// timer contract; a hung close inside vetCrossSurfacePatterns is the same
+// closeWithTimeout call shape.

@@ -1,12 +1,57 @@
 import { readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { chromium } from "playwright";
+import { chromium, type Browser, type LaunchOptions } from "playwright";
 import { runAxe } from "../runner/axe-scan.ts";
 import { loadAllSurfaces, loadSurface } from "../surface/loader.ts";
 import { resolveAuthStatePath } from "../auth/capture.ts";
 import type { RunReport } from "./schema.ts";
 import { readFlowResultOrWarn, readRunReportOrWarn } from "./io.ts";
 import { findLatestRunDir } from "./build.ts";
+
+/**
+ * Test seam mirroring src/runner/browser.ts. Tests inject a stub launcher to
+ * assert close-time discipline (bounded close fires when chromium hangs)
+ * without spawning a real browser.
+ */
+export interface BrowserLauncher {
+  launch(opts: LaunchOptions): Promise<Browser>;
+}
+let _launcher: BrowserLauncher = chromium;
+export function _setBrowserLauncherForTesting(l: BrowserLauncher | undefined): void {
+  _launcher = l ?? chromium;
+}
+
+/**
+ * Bounded close. Mirrors the discipline in src/runner/browser.ts. Without this
+ * a hung Playwright close (e.g. ffmpeg-style stuck graceful shutdown observed
+ * in codex audit 2026-05-14) blocks cross-surface vetting indefinitely. Three
+ * call sites here don't justify a shared util module; if a fourth caller shows
+ * up, refactor to a single helper.
+ *
+ * Exported for direct unit-test coverage of the timeout path.
+ */
+const DEFAULT_CLOSE_TIMEOUT_MS = 8_000;
+export function closeWithTimeout(
+  label: string,
+  p: Promise<void>,
+  ms: number = DEFAULT_CLOSE_TIMEOUT_MS,
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<void>((resolve) => {
+    timer = setTimeout(() => resolve(), ms);
+  });
+  return Promise.race([
+    p.catch((err) => {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[gauntlet] ${label} threw during close: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }),
+    timeout,
+  ]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
 
 export interface SurfaceRun {
   surfaceId: string;
@@ -410,7 +455,7 @@ export async function vetCrossSurfacePatterns(
   // Visit every surface once, collect axe-rule sets.
   const axeRulesBySurface = new Map<string, Set<string>>();
   const navFailures = new Map<string, string>();
-  const browser = await chromium.launch({ headless });
+  const browser = await _launcher.launch({ headless });
   try {
     for (const s of surfaceMeta) {
       const context = await browser.newContext(
@@ -425,11 +470,11 @@ export async function vetCrossSurfacePatterns(
       } catch (err) {
         navFailures.set(s.id, err instanceof Error ? err.message : String(err));
       } finally {
-        await context.close().catch(() => undefined);
+        await closeWithTimeout(`context.close(${s.id})`, context.close());
       }
     }
   } finally {
-    await browser.close().catch(() => undefined);
+    await closeWithTimeout("browser.close", browser.close());
   }
 
   // Stamp every pattern.

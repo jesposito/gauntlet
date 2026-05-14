@@ -144,6 +144,44 @@ describe("text renderer (non-TTY mode = CI/piped output)", () => {
     expect(buf.raw()).not.toMatch(/\[marketing\]/);
   });
 
+  test("setup_op_end shows duration + ok status", () => {
+    // Codex audit 2026-05-14: setup ops were silent end-to-end, so a wedge
+    // during browser_launch / new_context / goto on slow sites looked the
+    // same as a normal-but-slow setup. The renderer now narrates each op.
+    const buf = makeBuffer();
+    const r = createTextRenderer({ isTTY: false, color: false, out: buf });
+    r({
+      type: "setup_op_end",
+      personaId: "p",
+      flowId: "f",
+      op: "browser_launch",
+      durationMs: 1234,
+      ok: true,
+      ts: 1,
+    });
+    expect(buf.raw()).toContain("setup browser_launch");
+    expect(buf.raw()).toContain("done");
+    expect(buf.raw()).toContain("1.2s");
+  });
+
+  test("setup_op_end surfaces failure detail on timeout", () => {
+    const buf = makeBuffer();
+    const r = createTextRenderer({ isTTY: false, color: false, out: buf });
+    r({
+      type: "setup_op_end",
+      personaId: "p",
+      flowId: "f",
+      op: "goto",
+      durationMs: 60_000,
+      ok: false,
+      error: "setup:goto exceeded 60000ms",
+      ts: 1,
+    });
+    expect(buf.raw()).toContain("setup goto");
+    expect(buf.raw()).toContain("failed");
+    expect(buf.raw()).toContain("exceeded 60000ms");
+  });
+
   test("persona shortname falls through to last-2 segments on actual collision", () => {
     // Two personas with the same last segment ("creator"). The second one
     // gets "skeptical-creator" so per-persona attribution stays honest.

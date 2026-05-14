@@ -199,6 +199,25 @@ export function createTextRenderer(opts: TextRendererOptions = {}): (e: Gauntlet
         return; // phase_end is for JSONL/timing; text output is implicit in the next phase header
       }
 
+      case "setup_op_start": {
+        // Setup ops can wedge silently (browser_launch / new_context / goto on
+        // slow sites). Use the spinner to make "currently doing X" visible.
+        startOp(`setup:${e.personaId}:${e.flowId}:${e.op}`, `setup ${e.op}`, "run");
+        return;
+      }
+
+      case "setup_op_end": {
+        const status = e.ok ? paint("done", "32") : paint("failed", "31");
+        const detail = e.ok ? "" : `: ${truncate(e.error ?? "error", 80)}`;
+        endOp(
+          `setup:${e.personaId}:${e.flowId}:${e.op}`,
+          quiet
+            ? undefined
+            : `    setup ${e.op}  ${status}  ${(e.durationMs / 1000).toFixed(1)}s${detail}`,
+        );
+        return;
+      }
+
       case "ai_call_start": {
         const label = `AI: ${e.purpose}`;
         startOp(e.callId, label, /* best-guess phase: */ purposeToPhase(e.purpose));
