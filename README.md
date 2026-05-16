@@ -10,6 +10,8 @@
 
 **Drive AI personas through your web app. Find the failures real users would hit before they hit them.**
 
+[![Join the Facet HQ Discord](https://img.shields.io/badge/Discord-Join%20Facet%20HQ-5865F2?logo=discord&logoColor=white)](https://discord.gg/XD8eUudnmf)
+
 Every accessibility tool tells you what `axe-core` already tells you. Every "AI agent" tool drives a browser but has no theory of who's using it. Gauntlet sits in the middle: an impatient mobile creator, a skeptical first-time visitor, a keyboard-only screen-reader user, each one trying to complete a real task on your real app. The runner captures everything they tripped over — screenshots, DOM, axe-core violations, console errors, network failures, and the persona's own verdict on whether they would've given up.
 
 Self-hosted. MIT. Bring your own AI key.
