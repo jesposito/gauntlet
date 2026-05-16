@@ -1,5 +1,13 @@
 # Gauntlet
 
+[![Latest version](https://img.shields.io/github/v/tag/jesposito/gauntlet?label=version&sort=semver&color=blueviolet)](https://github.com/jesposito/gauntlet/tags)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178C6?logo=typescript&logoColor=white)](https://typescriptlang.org)
+[![Playwright](https://img.shields.io/badge/runner-Playwright-2EAD33?logo=playwright&logoColor=white)](https://playwright.dev)
+[![BYO AI agent](https://img.shields.io/badge/AI-BYO%20agent-9333ea)](#)
+[![Self-hosted](https://img.shields.io/badge/self--hosted-yes-2ea44f)](#)
+[![Stars](https://img.shields.io/github/stars/jesposito/gauntlet?style=social)](https://github.com/jesposito/gauntlet/stargazers)
+
 **Drive AI personas through your web app. Find the failures real users would hit before they hit them.**
 
 Every accessibility tool tells you what `axe-core` already tells you. Every "AI agent" tool drives a browser but has no theory of who's using it. Gauntlet sits in the middle: an impatient mobile creator, a skeptical first-time visitor, a keyboard-only screen-reader user, each one trying to complete a real task on your real app. The runner captures everything they tripped over — screenshots, DOM, axe-core violations, console errors, network failures, and the persona's own verdict on whether they would've given up.
