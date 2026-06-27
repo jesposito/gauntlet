@@ -6,7 +6,20 @@ import {
   registerProvider,
 } from "./provider.ts";
 
-const API_URL = "https://api.openai.com/v1/chat/completions";
+const DEFAULT_API_URL = "https://api.openai.com/v1/chat/completions";
+
+/**
+ * Resolve the chat-completions endpoint. Defaults to OpenAI; OPENAI_BASE_URL
+ * points gauntlet at any OpenAI-compatible endpoint (Sakana, OpenRouter,
+ * Together, Groq, a local vLLM, ...). The base is expected to end at the API
+ * root (e.g. https://api.sakana.ai/v1); "/chat/completions" is appended unless
+ * it is already present.
+ */
+export function resolveOpenAiUrl(baseUrl = process.env.OPENAI_BASE_URL): string {
+  if (!baseUrl) return DEFAULT_API_URL;
+  const trimmed = baseUrl.replace(/\/+$/, "");
+  return trimmed.endsWith("/chat/completions") ? trimmed : `${trimmed}/chat/completions`;
+}
 
 interface OpenAiResponse {
   choices?: { message?: { content?: string } }[];
@@ -17,6 +30,7 @@ class OpenAiProvider implements AiProvider {
   readonly name = "openai";
   readonly model: string;
   private readonly apiKey: string;
+  private readonly apiUrl: string;
 
   constructor(model: string) {
     const apiKey = process.env.OPENAI_API_KEY;
@@ -24,6 +38,7 @@ class OpenAiProvider implements AiProvider {
       throw new Error("OPENAI_API_KEY not set.");
     }
     this.apiKey = apiKey;
+    this.apiUrl = resolveOpenAiUrl();
     this.model = model;
   }
 
@@ -34,7 +49,7 @@ class OpenAiProvider implements AiProvider {
       last.content = `${last.content}\n\nReturn ONLY JSON matching the "${opts.schemaName}" schema. ${opts.schemaDescription ?? ""}`.trim();
     }
 
-    const res = await fetch(API_URL, {
+    const res = await fetch(this.apiUrl, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -66,6 +81,9 @@ class OpenAiProvider implements AiProvider {
 export const openaiFactory: ProviderFactory = {
   id: "openai",
   modelPrefixes: ["gpt-", "o1-", "o3-"],
+  // When OPENAI_BASE_URL points at an OpenAI-compatible endpoint, accept any
+  // model id that no other provider claimed (e.g. a vendor's own model names).
+  acceptsAsFallback: () => Boolean(process.env.OPENAI_BASE_URL),
   create: (model: string) => new OpenAiProvider(model),
 };
 

@@ -56,6 +56,14 @@ export interface AiProvider {
 export interface ProviderFactory {
   readonly id: string;
   readonly modelPrefixes: string[];
+  /**
+   * Optional last-resort claim. When prefix matching finds no provider for a
+   * model, any factory whose acceptsAsFallback() returns true claims it. Lets
+   * an OpenAI-compatible endpoint (configured via OPENAI_BASE_URL) accept
+   * arbitrary model ids — a vendor's own model names — without inventing a
+   * prefix for each one.
+   */
+  acceptsAsFallback?(): boolean;
   create(model: string): AiProvider;
 }
 
@@ -131,14 +139,21 @@ export function pickProvider(model: string): AiProvider {
       return new CachingProvider(f.create(model));
     }
   }
+  // No prefix matched. Let an opted-in provider (e.g. an OpenAI-compatible
+  // endpoint configured via OPENAI_BASE_URL) claim arbitrary model ids.
+  for (const f of factories) {
+    if (f.acceptsAsFallback?.()) {
+      return new CachingProvider(f.create(model));
+    }
+  }
   throw new Error(
     `no provider for model "${model}". known prefixes: ${factories
       .flatMap((f) => f.modelPrefixes)
-      .join(", ")}`,
+      .join(", ")}. Set OPENAI_BASE_URL to route any model id to an OpenAI-compatible endpoint.`,
   );
 }
 
-export const DEFAULT_MODEL = "claude-opus-4-7";
+export const DEFAULT_MODEL = "claude-opus-4-8";
 
 export function extractJsonBlock(text: string): string {
   const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/);
