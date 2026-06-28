@@ -14,6 +14,9 @@ unbounded `await` in the codebase is now bounded, narrated, or both.
 
 ### Added
 
+- **OpenAI-compatible endpoints via `OPENAI_BASE_URL`.** Point gauntlet at any
+  OpenAI-compatible API (Sakana, OpenRouter, Together, Groq, a local vLLM); any
+  `--model <id>` routes there using your `OPENAI_API_KEY`, no prefix needed.
 - **`--events-log <path>`** on every long-running command (`run`, `report`,
   `init`, `flows`, `seed`). Appends every `GauntletEvent` as JSONL — one
   event per line, every line carries `ts`. For Claude (or any agent / CI)
@@ -75,6 +78,7 @@ unbounded `await` in the codebase is now bounded, narrated, or both.
 
 ### Changed
 
+- **Default model bumped `claude-opus-4-7` → `claude-opus-4-8`** (latest Opus). `--model <id>` still overrides; the prefix routes the provider.
 - **Discriminated-union schemas for runner contracts.**
   - `LocatorPickSchema` is now keyed on `match_kind: "element" | "text" |
     "none"`. Text-only observation no longer wired as failure — it

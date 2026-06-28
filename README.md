@@ -413,7 +413,15 @@ The runner is built for unpredictable real-world pages. Borrowed from prior art 
 | Google | `gemini-` | `GOOGLE_API_KEY` or `GEMINI_API_KEY` |
 | Ollama (local) | `ollama/`, `llama`, `qwen`, `mistral`, `deepseek` | `OLLAMA_HOST` (default `http://localhost:11434`) |
 
-Default: `claude-opus-4-7`. Pick a different model by passing `--model <id>` — the prefix routes the provider automatically.
+Default: `claude-opus-4-8`. Pick a different model by passing `--model <id>` — the prefix routes the provider automatically.
+
+**Any OpenAI-compatible endpoint.** Set `OPENAI_BASE_URL` (e.g. `https://api.sakana.ai/v1`, OpenRouter, Together, Groq, a local vLLM) and gauntlet routes **any** `--model <id>` through it using your `OPENAI_API_KEY` — no prefix needed. Uses the OpenAI `chat/completions` wire format.
+
+```bash
+export OPENAI_BASE_URL=https://api.sakana.ai/v1
+export OPENAI_API_KEY=$SAKANA_API_KEY
+bun run src/cli.ts run https://your-app.com --model fugu
+```
 
 Responses are cached on disk at `.gauntlet/cache/ai/` (mode `0700` directory, `0600` files) keyed on `(provider, model, messages, schema, maxTokens, temperature)`. Because the prompt includes the live DOM outline, cache entries naturally invalidate when the page changes. Pass `--no-cache` to force fresh inference. The run summary prints a `cache: hits=N misses=N writes=N (P% hit-rate)` line so a fast re-run advertises whether it's real or replayed.
 

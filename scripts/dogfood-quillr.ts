@@ -21,7 +21,7 @@ const url = process.argv[3] ?? "http://100.110.251.103:3000/";
 const numPersonas = Number(process.argv[4] ?? 4);
 
 configureAiCache({ enabled: true, cwd });
-const provider = pickProvider("claude-opus-4-7");
+const provider = pickProvider("claude-opus-4-8");
 
 console.log(`dogfood: cwd=${cwd} url=${url} personas=${numPersonas}`);
 

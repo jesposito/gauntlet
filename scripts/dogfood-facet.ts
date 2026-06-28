@@ -24,7 +24,7 @@ const urls = [
   "https://jed.facetcloud.io/admin",
 ];
 const numPersonas = Number(process.argv[3] ?? 6);
-const model = process.argv[4] ?? process.env.GAUNTLET_MODEL ?? "claude-opus-4-7";
+const model = process.argv[4] ?? process.env.GAUNTLET_MODEL ?? "claude-opus-4-8";
 
 configureAiCache({ enabled: true, cwd });
 const provider = pickProvider(model);
