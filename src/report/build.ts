@@ -12,6 +12,12 @@ export interface BuildReportOptions {
   vet?: boolean;
   vetHeadless?: boolean;
   /**
+   * Per-finding wallclock budget (ms) forwarded to vetAll's perFindingBudgetMs.
+   * Undefined = let vetAll use its built-in default. Set via the `--vet-timeout`
+   * CLI flag for heavy SPAs whose axe scan needs more (or less) than 60s.
+   */
+  vetTimeoutMs?: number;
+  /**
    * Optional event emitter forwarded to the vetter so the report-build phase
    * narrates itself in real time. Defaults to nullEmitter (silent), so
    * existing call sites keep working unchanged.
@@ -49,6 +55,17 @@ async function inferRunMeta(runDir: string, personaReports: PersonaReport[]): Pr
         /* skip */
       }
     }
+    // Legacy single-step runs (browser.ts runPersona) write no flow-result.json
+    // — only meta.json directly under the persona dir. Without this fallback
+    // url/startedAt/finishedAt stay empty and REPORT.md shows a blank "- URL:".
+    try {
+      const meta = JSON.parse(await readFile(join(runDir, pr.personaId, "meta.json"), "utf8"));
+      if (typeof meta.startedAt === "number") startedAt = Math.min(startedAt, meta.startedAt);
+      if (typeof meta.finishedAt === "number") finishedAt = Math.max(finishedAt, meta.finishedAt);
+      if (!url && typeof meta.url === "string") url = meta.url;
+    } catch {
+      /* not a legacy run, or no meta.json */
+    }
   }
   if (!isFinite(startedAt)) startedAt = Date.now();
   if (finishedAt === 0) finishedAt = startedAt;
@@ -67,6 +84,7 @@ export async function buildReport(opts: BuildReportOptions): Promise<BuildReport
     for (const pr of personaReports) {
       pr.findings = await vetAll(pr.findings, {
         headless: opts.vetHeadless ?? true,
+        ...(opts.vetTimeoutMs !== undefined ? { perFindingBudgetMs: opts.vetTimeoutMs } : {}),
         emit,
       });
     }
