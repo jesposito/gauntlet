@@ -24,7 +24,7 @@ import { loadSitesFile, runBench, saveBenchReport } from "./bench/runner.ts";
 import { renderPrComment } from "./comment/render.ts";
 import { readFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
-import { DEFAULT_MODEL, pickProvider } from "./ai/index.ts";
+import { type AiProvider, DEFAULT_MODEL, pickProvider } from "./ai/index.ts";
 import { configureAiCache, getAiCache } from "./ai/cache.ts";
 import { readProject } from "./init/project-reader.ts";
 import { loadTemplates } from "./persona/templates.ts";
@@ -149,6 +149,38 @@ function splitCsv(v: string | boolean | undefined): string[] {
   return v.split(",").map((s) => s.trim()).filter(Boolean);
 }
 
+/**
+ * Detect a run that never exercised the live AI persona path, so a false-green
+ * (a dead/expired key, or the legacy no-flows capture) can't masquerade as a
+ * clean exit-0 success. Pure so it's trivially testable.
+ *
+ * Liveness comes from `liveAiCalls`: the count of non-cached `ai_call_end`
+ * events the parent observed on the event stream. This is ground truth in BOTH
+ * run modes — in supervised mode (the default) every propose() runs inside a
+ * flow-worker subprocess and the parent's AiCache stats stay {0,0,0}, but the
+ * worker still streams its ai_call_end events up through the supervisor, so the
+ * parent sees them either way. (Cache HITS emit cached:true and don't count: a
+ * replay doesn't touch the live provider. A warm-cache re-run is therefore
+ * liveAiCalls===0 with totalFlows>0 — the flow path ran, just nothing live.)
+ *
+ * Only two states are genuine false-greens: totalFlows===0 (the legacy/no-flows
+ * single-step path) and a flows run where ZERO live calls happened AND nothing
+ * was replayed from cache either (cacheHits===0) — the dead-key signature.
+ */
+export function shouldWarnNoAiExercised(args: {
+  totalFlows: number;
+  liveAiCalls: number;
+  cacheHits: number;
+}): boolean {
+  if (args.totalFlows === 0) return true;
+  return args.liveAiCalls === 0 && args.cacheHits === 0;
+}
+
+export const NO_AI_EXERCISED_MESSAGE =
+  "AI path not exercised: 0 live AI calls and 0 cache replays this run. " +
+  "Either no flows ran (legacy capture) or every flow errored before calling the " +
+  "model — check your key with gauntlet doctor, or run gauntlet flows first.";
+
 async function cmdRun(args: ParsedArgs): Promise<void> {
   const surfaceArg = typeof args.flags.surface === "string" ? args.flags.surface : undefined;
   const prArg = typeof args.flags.pr === "string" ? args.flags.pr : undefined;
@@ -232,7 +264,21 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
   const cwd = process.cwd();
   configureAiCache({ enabled: cacheEnabled, cwd });
 
-  const emit = await buildEmitter({ quiet, noColor, ...(eventsLog ? { eventsLog } : {}) });
+  const baseEmit = await buildEmitter({ quiet, noColor, ...(eventsLog ? { eventsLog } : {}) });
+  // Count AI calls off the event stream, split live vs replayed. In supervised
+  // mode (default) propose() runs in the flow-worker subprocess so the parent's
+  // AiCache stats stay 0 — but every ai_call_end still streams up through the
+  // supervisor (carrying `cached`), so this is the only signal that works in
+  // BOTH modes. live = real provider hit; replay = served from cache.
+  let liveAiCalls = 0;
+  let replayedAiCalls = 0;
+  const emit: typeof baseEmit = (e) => {
+    if (e.type === "ai_call_end") {
+      if (e.cached) replayedAiCalls += 1;
+      else liveAiCalls += 1;
+    }
+    baseEmit(e);
+  };
   const onFlowEvent = flowEventBridge(emit);
 
   const filterCriteria: FlowFilterCriteria = {
@@ -524,11 +570,27 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
 
   // Cache transparency: shows whether a fast run was real or replayed.
   const cache = getAiCache();
+  const cacheStats = cache?.stats() ?? { hits: 0, misses: 0, writes: 0 };
   if (cache?.enabled) {
-    const s = cache.stats();
-    const total = s.hits + s.misses;
-    const pct = total > 0 ? Math.round((s.hits / total) * 100) : 0;
-    console.log(`cache: hits=${s.hits} misses=${s.misses} writes=${s.writes} (${pct}% hit-rate)`);
+    const total = cacheStats.hits + cacheStats.misses;
+    const pct = total > 0 ? Math.round((cacheStats.hits / total) * 100) : 0;
+    console.log(`cache: hits=${cacheStats.hits} misses=${cacheStats.misses} writes=${cacheStats.writes} (${pct}% hit-rate)`);
+  }
+
+  // No-flows / dead-key guard. A run that made ZERO live AI calls looks like a
+  // green success but never exercised the persona path — masks an expired key
+  // or a roster with no flows. Warn loudly through the event stream (both
+  // renderers + any --events-log) so the false-green is impossible to miss.
+  if (
+    shouldWarnNoAiExercised({
+      totalFlows,
+      liveAiCalls,
+      // Replays seen on the event stream (works in supervised mode, where the
+      // parent's cacheStats stay 0) OR the in-process cache's own hit count.
+      cacheHits: Math.max(replayedAiCalls, cacheStats.hits),
+    })
+  ) {
+    emit({ type: "warn", message: NO_AI_EXERCISED_MESSAGE, context: "run", ts: Date.now() });
   }
 
   // Detect "every flow crashed for the same reason" — almost always a setup
@@ -557,7 +619,13 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
     // that this call site dropped emit: tests passed because they passed
     // emit directly, but production runs left users staring at silent terminals
     // for the duration of vet (the felt-bad "25-min black box" from yesterday).
-    const built = await buildReport({ runDir: baseDir, vet: true, emit });
+    const vetTimeoutMs = parseVetTimeout(args.flags["vet-timeout"], emit);
+    const built = await buildReport({
+      runDir: baseDir,
+      vet: true,
+      ...(vetTimeoutMs !== undefined ? { vetTimeoutMs } : {}),
+      emit,
+    });
     emit({
       type: "phase_end",
       phase: "report",
@@ -726,6 +794,78 @@ async function cmdDoctor(args: ParsedArgs): Promise<void> {
     console.log("  gauntlet doctor --reap-tmp        # clean stale Playwright tmpdirs");
     console.log("  gauntlet doctor --all             # both, with default keep=5");
   }
+
+  // AI provider liveness check — catches a dead/expired API key here instead of
+  // mid-run (production hit a 401 partway through a run this week).
+  console.log("");
+  const model = typeof args.flags.model === "string" ? args.flags.model : DEFAULT_MODEL;
+  const code = await doctorProviderCheck(model, args.flags["skip-keys"] === true);
+  // Only set on failure: leave exitCode unset on success so the entrypoint's
+  // `process.exitCode ?? 0` stays 0 and we don't clobber any earlier code.
+  if (code !== 0) process.exitCode = code;
+}
+
+/**
+ * Run doctor's provider liveness check and map the outcome to an exit code.
+ * Extracted + exported so the CI-gating contract (a dead/expired key -> exit 1,
+ * not a green exit-0 the entrypoint then propagates) is unit-testable without
+ * spawning the whole CLI. Returns 0 = OK/skipped, 1 = unresolvable provider or
+ * failed key. Resolution of pickProvider is injectable for tests.
+ */
+export async function doctorProviderCheck(
+  model: string,
+  skipKeys: boolean,
+  deps?: {
+    resolve?: (model: string) => AiProvider;
+    preflight?: (p: AiProvider) => Promise<{ ok: true } | { ok: false; error: string }>;
+  },
+): Promise<0 | 1> {
+  if (skipKeys) {
+    console.log("provider: skipped (--skip-keys)");
+    return 0;
+  }
+  const resolve = deps?.resolve ?? pickProvider;
+  const preflight =
+    deps?.preflight ?? (await import("./ai/preflight.ts")).preflightProvider;
+  let provider: AiProvider;
+  try {
+    provider = resolve(model);
+  } catch (err) {
+    console.log(`provider ${model}: FAILED — ${err instanceof Error ? err.message : String(err)}`);
+    return 1;
+  }
+  const res = await preflight(provider);
+  if (res.ok) {
+    console.log(`provider ${provider.name}/${provider.model}: OK`);
+    return 0;
+  }
+  console.log(`provider ${provider.name}/${provider.model}: FAILED — ${res.error}`);
+  return 1;
+}
+
+/**
+ * Parse the optional `--vet-timeout <ms>` flag into a per-finding budget for
+ * vetAll. Reuses parsePositiveIntFlag for validation, but — unlike most
+ * numeric flags — a bad value here warns and is ignored (falls back to the
+ * vetter's built-in default) rather than aborting the whole report. Warns
+ * through the event stream so the renderers own user-facing output.
+ */
+export function parseVetTimeout(
+  raw: string | boolean | undefined,
+  emit: EventEmitter,
+): number | undefined {
+  try {
+    const ms = parsePositiveIntFlag("vet-timeout", raw, 0);
+    return ms === 0 ? undefined : ms;
+  } catch (err) {
+    emit({
+      type: "warn",
+      message: `${err instanceof Error ? err.message : String(err)} Ignoring --vet-timeout; using default vetter budget.`,
+      context: "flag",
+      ts: Date.now(),
+    });
+    return undefined;
+  }
 }
 
 async function cmdReport(args: ParsedArgs): Promise<void> {
@@ -754,7 +894,13 @@ async function cmdReport(args: ParsedArgs): Promise<void> {
     ts: reportStartedAt,
   });
   // Pass `emit` so vetter heartbeat reaches the user (codex audit 2026-05-14).
-  const built = await buildReport({ runDir: target, vet: !skipVet, emit });
+  const vetTimeoutMs = parseVetTimeout(args.flags["vet-timeout"], emit);
+  const built = await buildReport({
+    runDir: target,
+    vet: !skipVet,
+    ...(vetTimeoutMs !== undefined ? { vetTimeoutMs } : {}),
+    emit,
+  });
   emit({
     type: "phase_end",
     phase: "report",
@@ -1519,7 +1665,7 @@ usage:
                [--flows <id[,id...]>] [--features <name[,...]>]
                [--tags <tag[,...]>] [--exclude-tags <tag[,...]>]
                [--paths <path[,...]>]
-  gauntlet report [<run-dir>] [--run <path>] [--no-vet]
+  gauntlet report [<run-dir>] [--run <path>] [--no-vet] [--vet-timeout <ms>]
   gauntlet surfaces
   gauntlet auth <surface-id> [--url <login-url>]
   gauntlet seed [<cwd>] --url <urls> [--personas N] [--flows N]
@@ -1609,6 +1755,9 @@ run misc:
   --no-cache            disable AI response cache
   --no-flows            force legacy single-step capture even if flows exist
   --no-report           skip post-run report build
+  --vet-timeout <ms>    per-finding vetter budget (default 60000). Raise for
+                        heavy SPAs whose axe replay needs longer. Invalid
+                        values warn and fall back to the default.
   --no-color            disable ANSI color in text renderer (NO_COLOR env honored too)
   --events-log <path>   append every event to this JSONL file. tail -f to drive
                         gauntlet from an agent (Claude) in real time.
@@ -1629,6 +1778,9 @@ doctor command — clean up gauntlet's filesystem footprint:
   gauntlet doctor --prune-runs [N]      keep latest N runs (default 5), delete the rest
   gauntlet doctor --reap-tmp            delete stale Playwright tmpdirs (>1h old)
   gauntlet doctor --all                 do both
+  gauntlet doctor --skip-keys           skip the AI provider key/network check
+  gauntlet doctor --model <id>          provider to key-check (default: ${DEFAULT_MODEL})
+  (the provider key/network check runs by default unless --skip-keys)
   --no-supervisor       run flows in-process instead of as a supervised
                         subprocess (debug only). Default ON — each flow runs
                         in its own detached process group with a parent-side
@@ -1646,6 +1798,7 @@ run examples:
 report flags:
   --run <path>       path to a run directory (default: latest under .gauntlet/runs/)
   --no-vet           skip replay vetting (faster, but findings stay unverified)
+  --vet-timeout <ms> per-finding vetter budget (default 60000); invalid -> default
   --no-color         disable ANSI color in text renderer
   --events-log <p>   append every event to this JSONL file (for agent tailing)
 
@@ -1715,8 +1868,10 @@ if (import.meta.main) {
   .then(() => {
     // Force exit: keep-alive HTTP sockets (Anthropic/OpenAI) and any lingering
     // Playwright handles can hold the event loop open even after all our work
-    // is done. We've already awaited everything we care about.
-    process.exit(0);
+    // is done. We've already awaited everything we care about. Honor any
+    // exit code a command already set (e.g. doctor's failed key check) instead
+    // of hard-coding 0 — otherwise a non-zero status never reaches CI/scripts.
+    process.exit(process.exitCode ?? 0);
   })
   .catch((err) => {
     // Bad numeric flag values are operator errors, not crashes. Print the
