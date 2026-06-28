@@ -343,4 +343,49 @@ describe("vetAll event emission", () => {
     // First URL has 2 findings sharing it.
     expect(urlStarts[0]!.findingCount).toBe(2);
   });
+
+  // Regression: pre-fix, a URL whose openSession failed was never cached, so
+  // every finding at that URL re-attempted the open. On a real supabase vet
+  // that meant 7 findings on one slow page = 7 × 60s timeouts (526s) and a
+  // "session 8/3" counter. openSession must run once per URL, then siblings
+  // short-circuit.
+  test("opens a failing URL's session once; siblings short-circuit to could_not_replay", async () => {
+    let newContextCalls = 0;
+    const fakePage = {
+      on: () => fakePage,
+      goto: async () => null,
+      waitForTimeout: async () => undefined,
+    } as const;
+    const browser = {
+      newContext: async () => {
+        newContextCalls += 1;
+        return { newPage: async () => fakePage, close: async () => undefined };
+      },
+      close: async () => undefined,
+    };
+    _setBrowserLauncherForTesting({ launch: async () => browser as never });
+    // axe throws -> openSession throws -> the URL's session fails to open.
+    _setAxeRunnerForTesting(async () => {
+      throw new Error("axe blew up");
+    });
+
+    const events: GauntletEvent[] = [];
+    const out = await vetAll(
+      [
+        baseFinding({ id: "f1", url: "https://slow.test/" }),
+        baseFinding({ id: "f2", url: "https://slow.test/" }),
+        baseFinding({ id: "f3", url: "https://slow.test/" }),
+      ],
+      { emit: (e) => events.push(e) },
+    );
+
+    // The shared URL is opened exactly once, not once per finding.
+    expect(newContextCalls).toBe(1);
+    // All three findings still resolve (could_not_replay) — none dropped.
+    expect(out.length).toBe(3);
+    expect(out.every((f) => f.vetting.status === "could_not_replay")).toBe(true);
+    // Only one vet_url_start -> sessionIndex never exceeds sessionTotal.
+    const urlStarts = events.filter((e) => e.type === "vet_url_start");
+    expect(urlStarts.length).toBe(1);
+  });
 });
