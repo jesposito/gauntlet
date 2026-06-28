@@ -368,6 +368,12 @@ export async function vetAll(findings: Finding[], opts: VetOptions = {}): Promis
   // Key sessions by (url, auth-state-path) so two findings from different
   // surfaces at the same URL don't get cross-contaminated cookies.
   const sessions = new Map<string, UrlSession>();
+  // URLs whose openSession already failed (timeout / nav error / axe blow-up),
+  // mapped to the failure message. Cached so the remaining findings at that URL
+  // short-circuit to could_not_replay instead of each re-attempting the same
+  // doomed open — pre-fix, 7 findings on one slow URL meant 7 × 60s timeouts
+  // and a nonsensical "session 8/3" progress counter.
+  const failedSessions = new Map<string, string>();
   // Map sessionKey -> remaining findings count, so vet_url_start can report
   // how many findings will be served by this session even though we group
   // by (url, auth-state) which is a superset key of (url, surfaceId).
@@ -407,9 +413,37 @@ export async function vetAll(findings: Finding[], opts: VetOptions = {}): Promis
         });
         continue;
       }
+      // Resolve auth + session key up front so the catch below can cache a
+      // per-URL failure under the same key. authStateFor never throws (it
+      // swallows loadSurface errors), so it's safe outside the try.
+      const authState = await authStateFor(f.surfaceId);
+      const sessionKey = `${f.url}|${authState ?? ""}`;
+
+      // This URL's session already failed to open — don't re-attempt it for
+      // every finding (each would hit the same timeout). Map straight to
+      // could_not_replay with the cached error and move on.
+      const priorFailure = failedSessions.get(sessionKey);
+      if (priorFailure !== undefined) {
+        out.push({
+          ...f,
+          vetting: {
+            status: "could_not_replay",
+            note: `vetter failure: ${priorFailure}`,
+          },
+        });
+        emit({
+          type: "vet_finding",
+          findingIndex,
+          total: findings.length,
+          findingId: f.id,
+          status: "could_not_replay",
+          ...(f.axeRuleId ? { ruleId: f.axeRuleId } : {}),
+          ts: Date.now(),
+        });
+        continue;
+      }
+
       try {
-        const authState = await authStateFor(f.surfaceId);
-        const sessionKey = `${f.url}|${authState ?? ""}`;
         let session = sessions.get(sessionKey);
         if (!session) {
           sessionIndex += 1;
@@ -451,12 +485,12 @@ export async function vetAll(findings: Finding[], opts: VetOptions = {}): Promis
           ts: Date.now(),
         });
       } catch (err) {
-        // Per-finding timeout (or any other openSession failure) — record as
-        // could_not_replay and keep going. The session, if partially opened,
-        // is leaked here for the duration of this vetAll call; the outer
-        // try/finally still reaps the browser at the end. Worth a follow-up
-        // if vetter passes ever stretch into thousands of findings.
+        // openSession failed (per-finding timeout, nav error, axe blow-up).
+        // Cache the failure under sessionKey so the remaining findings at this
+        // URL short-circuit above instead of re-opening; record this one as
+        // could_not_replay and keep going.
         const message = err instanceof Error ? err.message : String(err);
+        failedSessions.set(sessionKey, message);
         emit({
           type: "warn",
           message: `vetter failure on ${f.url}: ${message}`,
