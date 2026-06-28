@@ -123,6 +123,7 @@ Interactive curate prompts come up; you can drive them by piping `a` (accept) re
 | `--no-cache` | disable AI cache |
 | `--no-flows` | force legacy single-step capture |
 | `--no-report` | skip post-run report build |
+| `--vet-timeout <ms>` | per-finding vetting budget (default 60000); raise for heavy pages |
 | `--no-color` | disable ANSI |
 | `--events-log <path>` | **REQUIRED for agent-driven runs** — emit JSONL stream |
 | `--record-video` | opt-in WebM recording. Default OFF (Playwright's ffmpeg has no internal deadline; can wedge runs). Don't enable unless the user specifically asks for video. |
@@ -134,6 +135,7 @@ Interactive curate prompts come up; you can drive them by piping `a` (accept) re
 |---|---|
 | `--run <path>` | path to a run dir (default: latest under `.gauntlet/runs/`) |
 | `--no-vet` | skip vetting (faster, less reliable) |
+| `--vet-timeout <ms>` | per-finding vetting budget (default 60000); raise for heavy pages |
 | `--events-log <path>` | JSONL stream |
 
 ### `seed` — non-interactive `init + flows`
@@ -151,6 +153,7 @@ bun ~/gauntlet/src/cli.ts seed --url https://site.example.com
 - `cross-report` — aggregate findings across runs/surfaces
 - `bench` — run gauntlet against canned benchmark sites
 - `comment --pr <num>` — post top findings as a PR comment via `gh pr comment`
+- `doctor` — validate the provider key (one bounded call; `--skip-keys` to skip) + prune old runs / reap stale tmp. Run it first if a run dies on an auth error.
 - `help` — full help text
 
 ---

@@ -17,6 +17,12 @@ unbounded `await` in the codebase is now bounded, narrated, or both.
 - **OpenAI-compatible endpoints via `OPENAI_BASE_URL`.** Point gauntlet at any
   OpenAI-compatible API (Sakana, OpenRouter, Together, Groq, a local vLLM); any
   `--model <id>` routes there using your `OPENAI_API_KEY`, no prefix needed.
+- **`gauntlet doctor` provider preflight.** Validates your AI key with one
+  bounded ~16-token call and reports `OK` / `FAILED`, exiting non-zero so a
+  dead/expired key fails fast instead of as a mid-run 401. `--skip-keys` opts out.
+- **`--vet-timeout <ms>`** on `run` + `report`. Raises the vetter's per-finding
+  budget (default 60s) so a heavy page that can't reload + re-run axe in time
+  gets vetted instead of landing `could_not_replay`.
 - **`--events-log <path>`** on every long-running command (`run`, `report`,
   `init`, `flows`, `seed`). Appends every `GauntletEvent` as JSONL — one
   event per line, every line carries `ts`. For Claude (or any agent / CI)
@@ -79,6 +85,13 @@ unbounded `await` in the codebase is now bounded, narrated, or both.
 ### Changed
 
 - **Default model bumped `claude-opus-4-7` → `claude-opus-4-8`** (latest Opus). `--model <id>` still overrides; the prefix routes the provider.
+- **No-AI-call guard.** A run that made zero live AI calls now emits a loud
+  `warn` instead of a silent exit 0 — the false-green that hid a dead key.
+  Liveness is counted off the `ai_call_end` event stream, so it's correct in
+  the default supervised mode (where the parent process's AI cache stays empty).
+- **Exit codes propagate.** The CLI entrypoint now exits with
+  `process.exitCode ?? 0`, so `doctor`'s failed key check (and malformed-YAML
+  diagnostics in `surfaces` / `list`) actually reach CI instead of always 0.
 - **Discriminated-union schemas for runner contracts.**
   - `LocatorPickSchema` is now keyed on `match_kind: "element" | "text" |
     "none"`. Text-only observation no longer wired as failure — it
@@ -118,6 +131,13 @@ unbounded `await` in the codebase is now bounded, narrated, or both.
 
 ### Fixed
 
+- **Vetter opens each URL's session once, even on failure (#10).** Failed /
+  timed-out `openSession` results are now cached, so the remaining findings at
+  that URL short-circuit to `could_not_replay` instead of each re-attempting the
+  same doomed open. A real supabase vet hit 7 findings × 60s on one slow page;
+  now it's one attempt per URL.
+- **Legacy single-step `REPORT.md` shows the run URL (#11).** `inferRunMeta`
+  falls back to `meta.json`, so no-flows runs no longer render a blank `- URL:`.
 - **Vetter no longer hangs after axe completes.** `closeSession`'s
   `context.close()` and `browser.close()` are wrapped with an 8s
   swallow-on-timeout so an orphaned context (parent chromium gone)

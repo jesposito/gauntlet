@@ -207,6 +207,7 @@ gauntlet seed                # Non-interactive init + flows; accepts every AI su
 gauntlet auth <surface-id>   # Headed login capture → .gauntlet/auth/<id>.json
 gauntlet run                 # Phase D (execute) + E + F (per-run report + vetting)
 gauntlet report              # Rebuild a report from a run directory
+gauntlet doctor              # Validate provider key + prune old runs / stale tmp
 gauntlet surfaces            # List curated surfaces
 gauntlet list                # List curated personas + flows
 gauntlet cross-report        # Aggregate signatures across surfaces → CROSS-REPORT.md
@@ -266,7 +267,7 @@ gauntlet run [<url> | --url <url> | --surface <id> | --pr <num>]
              [--concurrency <n>] [--quiet]
              [--events-log <path>] [--no-color]
              [--record-video] [--no-supervisor]
-             [--no-cache] [--no-flows] [--no-report]
+             [--no-cache] [--no-flows] [--no-report] [--vet-timeout <ms>]
 ```
 
 Target sources (combinable):
@@ -289,6 +290,10 @@ Observability flags (work on `run`, `report`, `init`, `flows`, `seed`):
 - `--no-supervisor` (run only) — fall back to in-process flow
   execution. Default is the per-flow worker process supervisor (see
   [Reliability](#reliability)).
+- `--vet-timeout <ms>` (run + report) — per-finding vetting budget.
+  Default 60s; raise it when a heavy SPA can't reload + re-run axe in
+  time (e.g. a large pricing page that times out at 60s and lands
+  `could_not_replay`).
 
 ```bash
 # Marketing site, one persona, one specific flow.
@@ -340,6 +345,15 @@ gauntlet comment [<run-dir>] --pr <num>
 ```
 
 Reads a built `report.json` and posts a compact PR comment via `gh pr comment`. Top findings ordered critical → minor, persona-abandon callouts highlighted, per-persona flow outcome rollup. `--dry-run` prints the body without posting.
+
+### `gauntlet doctor`
+
+```
+gauntlet doctor [--model <id>] [--skip-keys]
+                [--prune-runs N] [--reap-tmp] [--all]
+```
+
+Diagnostics + hygiene. By default it **validates your AI provider key**: one bounded ~16-token call to the configured provider (`--model`, else the default) that prints `provider <name>/<model>: OK` or `FAILED — <error>` and exits non-zero on failure, so a dead/expired key fails fast (in CI too) instead of surfacing as a mid-run 401. `--skip-keys` skips the network check entirely (no provider call, no cost). `--prune-runs N` keeps the latest N run dirs and deletes the rest; `--reap-tmp` clears stale Playwright tmpdirs; `--all` does both.
 
 ---
 
